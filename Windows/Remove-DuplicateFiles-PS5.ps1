@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 5.1
 <#
 用途：
   查找文件夹中的重复文件，先计算默认删除计划，再由用户确认默认删除、手动删除或退出。
@@ -9,6 +9,11 @@
   PathB  可选。双目录模式中的目标目录，只删除该目录中的重复文件。
   -s     包含隐藏文件和隐藏文件夹。
   -yes   跳过预览和菜单，直接执行默认删除计划。
+
+提示：
+  如遇脚本无法执行的问题，先在管理员PowerShell中运行以下命令允许本地执行脚本：
+  Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned
+  Unblock-File -LiteralPath .\Remove-DuplicateFiles-PS5.ps1
 #>
 
 [CmdletBinding()]
@@ -44,8 +49,8 @@ function Show-HelpText {
   查找文件夹中的重复文件，先展示默认删除预览，再根据模式由用户确认默认删除、手动删除或退出。
 
 用法：
-  pwsh -File .\Remove-DuplicateFiles.ps1 [-s] [-yes] <PathA> [PathB]
-  pwsh -File .\Remove-DuplicateFiles.ps1 -h
+  powershell -File .\Remove-DuplicateFiles-PS5.ps1 [-s] [-yes] <PathA> [PathB]
+  powershell -File .\Remove-DuplicateFiles-PS5.ps1 -h
 
 参数：
   -s
@@ -212,7 +217,7 @@ function Get-SampleContentHash {
 
     try {
         # 这里只做快速预筛选；真正删除前仍会使用完整 SHA-256 确认。
-        $hashBuffer = [byte[]]::new($SampleHashByteCount)
+        $hashBuffer = New-Object byte[] $SampleHashByteCount
 
         $firstRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
         if ($firstRead -gt 0) {
@@ -228,7 +233,7 @@ function Get-SampleContentHash {
             }
         }
 
-        [void]$sha256.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        [void]$sha256.TransformFinalBlock((New-Object byte[] 0), 0, 0)
         return [BitConverter]::ToString($sha256.Hash).Replace('-', '').ToLowerInvariant()
     }
     finally {
@@ -291,8 +296,12 @@ function Get-RelativePathText {
         [string]$PathPrefix
     )
 
-    $relativePathText = [System.IO.Path]::GetRelativePath($RootPath, $File.FullName)
-    if ($relativePathText.StartsWith('..', [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($relativePathText)) {
+    $normalizedRootPath = $RootPath.TrimEnd('\')
+    $rootPrefix = "$normalizedRootPath\"
+    if ($File.FullName.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relativePathText = $File.FullName.Substring($rootPrefix.Length)
+    }
+    else {
         $relativePathText = $File.Name
     }
 
@@ -311,7 +320,11 @@ function Get-DirectoryLabel {
     )
 
     $name = Split-Path -Leaf $RootPath.TrimEnd('\')
-    return [string]::IsNullOrWhiteSpace($name) ? $RootPath.TrimEnd('\') : $name
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        return $RootPath.TrimEnd('\')
+    }
+
+    return $name
 }
 
 # 按默认保留规则排序文件：文件名更短者优先，其次按文件名和完整路径排序。
@@ -381,7 +394,9 @@ function Find-DuplicateFileGroups {
         $processedLengthFileCount++
         Write-ProgressBar -Activity $lengthProgressActivity -Status '正在按文件大小归类' -ProcessedCount $processedLengthFileCount -TotalCount $FileList.Count -LastPercent ([ref]$lastLengthPercent)
 
-        $filesByLength[$file.Length] ??= [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        if (-not $filesByLength.ContainsKey($file.Length)) {
+            $filesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+        }
         $filesByLength[$file.Length].Add($file)
     }
 
@@ -597,7 +612,7 @@ function Read-ManualDeletionSelection {
             }
         }
 
-        $selectedFileNumbers = [System.Collections.Generic.List[int]]::new()
+        $selectedFileNumbers = New-Object System.Collections.Generic.List[int]
         $isValidSelection = $true
 
         foreach ($inputPart in ($trimmedInputText -split '[,，\s]+')) {
@@ -657,7 +672,7 @@ function Remove-DeletionItems {
 
     $deletedFileCount = 0
     $failedFileCount = 0
-    $deletedItemList = [System.Collections.Generic.List[object]]::new()
+    $deletedItemList = New-Object System.Collections.Generic.List[object]
     foreach ($deletionItem in $DeletionItemList) {
         try {
             Remove-Item -LiteralPath $deletionItem.File.FullName -Force -ErrorAction Stop
@@ -871,7 +886,9 @@ function New-ReferenceDirectoryDeletionPlan {
         $processedReferenceFileCount++
         Write-ProgressBar -Activity '参考目录文件大小分组' -Status '正在建立参考目录索引' -ProcessedCount $processedReferenceFileCount -TotalCount $referenceFileList.Count -LastPercent ([ref]$lastReferenceLengthPercent)
 
-        $referenceFilesByLength[$file.Length] ??= [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        if (-not $referenceFilesByLength.ContainsKey($file.Length)) {
+            $referenceFilesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+        }
         $referenceFilesByLength[$file.Length].Add($file)
     }
     Complete-ProgressBar
@@ -886,7 +903,9 @@ function New-ReferenceDirectoryDeletionPlan {
 
         # 目标文件只有在参考目录存在相同大小文件时，才需要进入后续哈希比较。
         if ($referenceFilesByLength.ContainsKey($file.Length)) {
-            $targetCandidatesByLength[$file.Length] ??= [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+            if (-not $targetCandidatesByLength.ContainsKey($file.Length)) {
+                $targetCandidatesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            }
             $targetCandidatesByLength[$file.Length].Add($file)
         }
     }

@@ -61,6 +61,7 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 
 - 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Downloads`；交互输入时可以粘贴带首尾引号的路径。
 - 脚本仅面向 PowerShell 7。
+- `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，仅用于需要 Windows PowerShell 5.1 的旧环境；该副本因 PowerShell 5.1 的中文 UTF-8 解析限制，使用 UTF-8 with BOM 保存。如需允许脚本执行，可先以管理员身份运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
 - 脚本会递归扫描子文件夹。
 - 默认不扫描隐藏文件和隐藏文件夹；如需包含隐藏项，请传入 `-s`。
 - `-yes` 会跳过预览和菜单，请只在确认默认删除规则符合预期时使用。

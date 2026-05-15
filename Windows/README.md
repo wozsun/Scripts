@@ -59,7 +59,7 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 
 ### 注意事项
 
-- 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Downloads`。
+- 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Downloads`；交互输入时可以粘贴带首尾引号的路径。
 - 脚本仅面向 PowerShell 7。
 - 脚本会递归扫描子文件夹。
 - 默认不扫描隐藏文件和隐藏文件夹；如需包含隐藏项，请传入 `-s`。

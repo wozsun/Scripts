@@ -139,6 +139,35 @@ function Write-StatusSummary {
     Write-Host $Message -ForegroundColor $Color
 }
 
+# 兼容交互输入时复制带引号的路径；Windows 路径本身不允许包含引号。
+function ConvertTo-UnquotedPathText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathText
+    )
+
+    $normalizedPathText = $PathText.Trim()
+    if ($normalizedPathText.Length -lt 2) {
+        return $normalizedPathText
+    }
+
+    $quotePairs = @(
+        @{ Open = '"'; Close = '"' }
+        @{ Open = "'"; Close = "'" }
+        @{ Open = '“'; Close = '”' }
+        @{ Open = '‘'; Close = '’' }
+    )
+
+    foreach ($quotePair in $quotePairs) {
+        if ($normalizedPathText.StartsWith($quotePair.Open, [System.StringComparison]::Ordinal) -and
+            $normalizedPathText.EndsWith($quotePair.Close, [System.StringComparison]::Ordinal)) {
+            return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
+        }
+    }
+
+    return $normalizedPathText
+}
+
 # 校验输入路径是否为存在的 Windows 绝对目录，并返回规范化后的完整路径。
 function Resolve-InputDirectory {
     param(
@@ -149,12 +178,14 @@ function Resolve-InputDirectory {
         [string]$ParameterName
     )
 
-    $isAbsolutePath = $Path -match '^[a-zA-Z]:[\\/]' -or $Path -match '^[\\/]{2}'
+    $normalizedPathText = ConvertTo-UnquotedPathText -PathText $Path
+
+    $isAbsolutePath = $normalizedPathText -match '^[a-zA-Z]:[\\/]' -or $normalizedPathText -match '^[\\/]{2}'
     if (-not $isAbsolutePath) {
         throw "$ParameterName 必须是 Windows 文件夹绝对路径。"
     }
 
-    $resolvedPaths = @(Resolve-Path -LiteralPath $Path -ErrorAction Stop)
+    $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
     if ($resolvedPaths.Count -ne 1) {
         throw "$ParameterName 必须只能解析到一个目录。"
     }
@@ -284,7 +315,7 @@ function Get-DirectoryLabel {
 }
 
 # 按默认保留规则排序文件：文件名更短者优先，其次按文件名和完整路径排序。
-function Sort-FilesByKeepPriority {
+function Get-FilesByKeepPriority {
     param(
         [Parameter(Mandatory = $true)]
         [System.IO.FileInfo[]]$FileList
@@ -303,7 +334,7 @@ function Select-DefaultKeepFile {
         [System.IO.FileInfo[]]$FileList
     )
 
-    return Sort-FilesByKeepPriority -FileList $FileList | Select-Object -First 1
+    return Get-FilesByKeepPriority -FileList $FileList | Select-Object -First 1
 }
 
 # 将待删除文件封装为包含文件对象和显示路径的删除项。
@@ -510,7 +541,7 @@ function Read-ManualDeletionSelection {
         [string]$Hash
     )
 
-    $orderedDuplicateFiles = @(Sort-FilesByKeepPriority -FileList $DuplicateFileGroup)
+    $orderedDuplicateFiles = @(Get-FilesByKeepPriority -FileList $DuplicateFileGroup)
     $defaultDeletionSelections = @(
         for ($index = 0; $index -lt $orderedDuplicateFiles.Count; $index++) {
             if ($orderedDuplicateFiles[$index].FullName -ne $DefaultKeepFile.FullName) {

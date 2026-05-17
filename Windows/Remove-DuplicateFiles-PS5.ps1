@@ -42,17 +42,32 @@ Set-StrictMode -Version Latest
 # 遇到未处理异常时立即进入 catch/退出流程，避免继续执行危险操作。
 $ErrorActionPreference = 'Stop'
 
-# 部分哈希预筛选时读取文件头尾的字节数；值越大越稳，扫描成本也越高。
-$SampleHashByteCount = 1MB
+# 部分哈希预筛选时读取文件头尾每段的字节数；值越大越稳，扫描成本也越高。
+$PartialHashSegmentByteCount = 256KB
 
-# 删除预览中分隔不同重复文件组的横线文本。
-$PreviewSeparatorText = '=' * 64
+# 删除预览中分隔不同重复文件组的横线长度。
+$PreviewSeparatorCellCount = 64
 
-# 文本进度条宽度；统一使用 # 和 -，便于在不同终端中保持可读。
+# 删除预览中分隔不同重复文件组的字符。
+$PreviewSeparatorCharacter = '='
+
+# 文本进度条宽度。
 $ProgressBarCellCount = 28
+
+# 文本进度条已完成部分的字符。
+$ProgressBarFilledCharacter = '#'
+
+# 文本进度条未完成部分的字符。
+$ProgressBarEmptyCharacter = '-'
+
+# 单行动态输出后附加的清理空格数量，用于覆盖上一轮较长输出的尾巴。
+$ConsoleLineClearPadding = 20
 
 # 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
 $AssumeYesGraceSeconds = 10
+
+# -yes 倒计时期间检查 Enter 输入的间隔。
+$AssumeYesInputPollIntervalMilliseconds = 100
 
 # 记录 -yes 倒计时是否被 Enter 取消；多目录分别执行时用于停止后续目录。
 $AssumeYesDeletionCancelled = $false
@@ -62,7 +77,7 @@ $AssumeYesDeletionCancelled = $false
 function Show-HelpText {
     Write-Host @'
 用途：
-  查找文件夹中的重复文件，先展示默认删除预览，再根据模式由用户确认默认删除、手动删除或退出。
+  查找重复文件，先预览，再选择删除或退出。
 
 用法：
   powershell -File .\Remove-DuplicateFiles-PS5.ps1 [-s] [-yes] [Path1] [Path2 ...]
@@ -71,34 +86,18 @@ function Show-HelpText {
   powershell -File .\Remove-DuplicateFiles-PS5.ps1 -h
 
 参数：
-  Path
-    一个或多个文件夹绝对路径。不带 -a/-c 时，每个目录会分别执行单目录扫描。
-  -a
-    多目录合并模式：把所有输入目录抽象为一个大目录，可查找跨目录重复文件。
-    输入目录不能相同，也不能互为父子目录。
-  -c
-    参考目录模式：第一个目录为参考目录，其余目录为目标目录。
-    只删除目标目录中与参考目录内容完全相同的文件。
-  -s
-    包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
-  -yes
-    跳过预览和菜单，等待 10 秒后执行默认删除计划；倒计时期间可按 Enter 取消，或按 Ctrl+C 中止。
+  Path   文件夹绝对路径；不带 -a/-c 时，每个目录单独扫描。
+  -a     多目录合并模式，把多个目录视作一个大目录。
+  -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
+  -s     包含隐藏文件和隐藏文件夹。
+  -yes   跳过预览和菜单，等待 10 秒后默认删除；可按 Enter 取消。
+  -h     显示帮助信息。
 
-模式：
-  单目录模式：
-    不带 -a/-c 时启用。可输入一个或多个目录，每个目录会单独扫描和处理。
-    默认保留文件名最短的文件；如长度相同，再按文件名和完整路径排序。
-
-  多目录合并模式：
-    传入 -a 时启用。所有输入目录会合并为一个虚拟目录扫描，可删除跨目录重复文件。
-    该模式提供默认删除、手动删除或退出选项。
-
-  参考目录模式：
-    传入 -c 时启用。第一个目录为参考目录，后续目录为目标目录。
-    参考目录不参与删除，也不提供手动删除选项。
-
-交互：
-  脚本会先展示删除预览；单目录和多目录合并模式提供默认删除、手动删除或退出选项，参考目录模式提供默认删除或退出选项。
+说明：
+  无路径且未指定 -a/-c 时，会先显示模式菜单。
+  单目录和多目录合并模式可默认删除、手动删除或退出。
+  参考目录模式只删除目标目录文件，可默认删除或退出。
+  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请加引号。
 '@
 }
 
@@ -142,10 +141,10 @@ function Write-ProgressBar {
 
     $filledWidth = [Math]::Floor(($percent / 100) * $ProgressBarCellCount)
     $emptyWidth = $ProgressBarCellCount - $filledWidth
-    $bar = ('#' * $filledWidth) + ('-' * $emptyWidth)
+    $bar = ($ProgressBarFilledCharacter * $filledWidth) + ($ProgressBarEmptyCharacter * $emptyWidth)
     $progressText = "[进度] $Activity [$bar] $percent% $Status ($ProcessedCount / $TotalCount)"
 
-    Write-Host -NoNewline "`r$progressText$(' ' * 20)" -ForegroundColor Cyan
+    Write-Host -NoNewline "`r$progressText$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Cyan
     $LastPercent.Value = $percent
 }
 
@@ -157,7 +156,7 @@ function Complete-ProgressBar {
 # 输出用于区分不同预览或结果块的分隔线。
 function Write-PreviewSeparator {
     Write-Host ""
-    Write-Host $PreviewSeparatorText -ForegroundColor DarkGray
+    Write-Host ($PreviewSeparatorCharacter * $PreviewSeparatorCellCount) -ForegroundColor DarkGray
 }
 
 # 输出阶段汇总；前置空行让它和列表内容、删除明细保持清楚间隔。
@@ -205,22 +204,23 @@ function Wait-AssumeYesDeletionGracePeriod {
     for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
         Write-Host -NoNewline "`r倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -ForegroundColor Yellow
 
-        for ($pollIndex = 0; $pollIndex -lt 10; $pollIndex++) {
+        $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $AssumeYesInputPollIntervalMilliseconds))
+        for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
             if (Test-EnterKeyPressed) {
                 $script:AssumeYesDeletionCancelled = $true
-                Write-Host "`r已取消 -yes 默认删除，未删除任何文件。$(' ' * 20)" -ForegroundColor Yellow
+                Write-Host "`r已取消 -yes 默认删除，未删除任何文件。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Yellow
                 return $false
             }
 
-            Start-Sleep -Milliseconds 100
+            Start-Sleep -Milliseconds $AssumeYesInputPollIntervalMilliseconds
         }
     }
 
-    Write-Host "`r倒计时结束，开始执行默认删除。$(' ' * 20)" -ForegroundColor Magenta
+    Write-Host "`r倒计时结束，开始执行默认删除。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Magenta
     return $true
 }
 
-# 兼容交互输入时复制带引号的路径；Windows 路径本身不允许包含引号。
+# 兼容交互输入时复制带首尾引号的路径；这里只移除成对包裹符号。
 function ConvertTo-UnquotedPathText {
     param(
         [Parameter(Mandatory = $true)]
@@ -249,6 +249,87 @@ function ConvertTo-UnquotedPathText {
     return $normalizedPathText
 }
 
+# 拆分交互输入的路径行：支持分号分隔，也支持在下一个片段看起来是绝对路径时按空格分隔。
+function Split-InteractivePathInput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathInput
+    )
+
+    $trimmedPathInput = $PathInput.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmedPathInput)) {
+        return @()
+    }
+
+    $pathPartList = New-Object System.Collections.Generic.List[string]
+    $currentInputPart = New-Object System.Text.StringBuilder
+    $quoteCloseByOpen = @{}
+    $quoteCloseByOpen.Add([string][char]34, [string][char]34)
+    $quoteCloseByOpen.Add([string][char]39, [string][char]39)
+    $quoteCloseByOpen.Add([string][char]0x201C, [string][char]0x201D)
+    $quoteCloseByOpen.Add([string][char]0x2018, [string][char]0x2019)
+    $activeClosingQuote = $null
+
+    for ($index = 0; $index -lt $trimmedPathInput.Length; $index++) {
+        $currentChar = $trimmedPathInput[$index].ToString()
+
+        if ($null -ne $activeClosingQuote) {
+            [void]$currentInputPart.Append($currentChar)
+            if ($currentChar -eq $activeClosingQuote) {
+                $activeClosingQuote = $null
+            }
+            continue
+        }
+
+        $currentInputText = $currentInputPart.ToString()
+        $canStartQuotedPath = [string]::IsNullOrWhiteSpace($currentInputText)
+        if (-not $canStartQuotedPath) {
+            $canStartQuotedPath = [char]::IsWhiteSpace($currentInputText[$currentInputText.Length - 1])
+        }
+
+        if ($canStartQuotedPath -and $quoteCloseByOpen.ContainsKey($currentChar)) {
+            $activeClosingQuote = $quoteCloseByOpen[$currentChar]
+            [void]$currentInputPart.Append($currentChar)
+            continue
+        }
+
+        if ($currentChar -eq ';') {
+            $pathPart = $currentInputPart.ToString().Trim()
+            if (-not [string]::IsNullOrWhiteSpace($pathPart)) {
+                $pathPartList.Add($pathPart)
+            }
+            [void]$currentInputPart.Clear()
+            continue
+        }
+
+        [void]$currentInputPart.Append($currentChar)
+    }
+
+    $lastPathPart = $currentInputPart.ToString().Trim()
+    if (-not [string]::IsNullOrWhiteSpace($lastPathPart)) {
+        $pathPartList.Add($lastPathPart)
+    }
+
+    $resultPathList = New-Object System.Collections.Generic.List[string]
+    $quoteStartPattern = @(
+        [regex]::Escape([string][char]34)
+        [regex]::Escape([string][char]39)
+        [regex]::Escape([string][char]0x201C)
+        [regex]::Escape([string][char]0x2018)
+    ) -join '|'
+    $absolutePathSeparatorPattern = '\s+(?=(?:' + $quoteStartPattern + ')?(?:[a-zA-Z]:[\\/]|[\\/]{2}))'
+    foreach ($pathPart in $pathPartList) {
+        foreach ($pathSegment in [regex]::Split($pathPart, $absolutePathSeparatorPattern)) {
+            $trimmedPathSegment = $pathSegment.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trimmedPathSegment)) {
+                $resultPathList.Add($trimmedPathSegment)
+            }
+        }
+    }
+
+    return $resultPathList.ToArray()
+}
+
 # 校验输入路径是否为存在的 Windows 绝对目录，并返回规范化后的完整路径。
 function Resolve-InputDirectory {
     param(
@@ -263,17 +344,29 @@ function Resolve-InputDirectory {
 
     $isAbsolutePath = $normalizedPathText -match '^[a-zA-Z]:[\\/]' -or $normalizedPathText -match '^[\\/]{2}'
     if (-not $isAbsolutePath) {
-        throw "$ParameterName 必须是 Windows 文件夹绝对路径。"
+        throw "$ParameterName 必须是 Windows 文件夹绝对路径: $normalizedPathText"
     }
 
-    $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
+    try {
+        $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
+    }
+    catch {
+        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格请加引号。原始错误: $($_.Exception.Message)"
+    }
+
     if ($resolvedPaths.Count -ne 1) {
         throw "$ParameterName 必须只能解析到一个目录。"
     }
 
-    $item = Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop
+    try {
+        $item = Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop
+    }
+    catch {
+        throw "$ParameterName 无法读取: $normalizedPathText。原因: $($_.Exception.Message)"
+    }
+
     if (-not $item.PSIsContainer) {
-        throw "$ParameterName 必须是文件夹。"
+        throw "$ParameterName 必须是文件夹: $normalizedPathText"
     }
 
     return $item.FullName
@@ -307,7 +400,8 @@ function Read-InteractivePathList {
     )
 
     $inputPathList = New-Object System.Collections.Generic.List[string]
-    Write-Host "未提供目录参数。请输入${ModeName}目录绝对路径，每行一个；直接回车开始执行或退出。" -ForegroundColor Yellow
+    Write-Host "请逐行输入${ModeName}目录绝对路径；也可同一行输入多个路径。" -ForegroundColor Yellow
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号；直接回车开始执行或退出。" -ForegroundColor DarkGray
 
     while ($true) {
         $pathInput = (Read-Host "Path$($inputPathList.Count + 1)").Trim()
@@ -325,7 +419,14 @@ function Read-InteractivePathList {
             return $inputPathList.ToArray()
         }
 
-        $inputPathList.Add($pathInput)
+        $pathInputList = @(Split-InteractivePathInput -PathInput $pathInput)
+        foreach ($inputPath in $pathInputList) {
+            $inputPathList.Add($inputPath)
+        }
+
+        if ($pathInputList.Count -gt 1) {
+            Write-Host "已识别 $($pathInputList.Count) 个路径。" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -407,6 +508,24 @@ function Test-IndependentDirectoryPair {
     }
 }
 
+# 单目录模式允许父子目录分别处理，但不允许同一目录重复输入。
+function Test-UniqueDirectorySet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$RootPathList
+    )
+
+    for ($leftIndex = 0; $leftIndex -lt $RootPathList.Count; $leftIndex++) {
+        $normalizedLeftPath = ConvertTo-NormalizedDirectoryPath -Path $RootPathList[$leftIndex]
+        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $RootPathList.Count; $rightIndex++) {
+            $normalizedRightPath = ConvertTo-NormalizedDirectoryPath -Path $RootPathList[$rightIndex]
+            if ($normalizedLeftPath.Equals($normalizedRightPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Path$($leftIndex + 1) 和 Path$($rightIndex + 1) 不能是同一个目录。"
+            }
+        }
+    }
+}
+
 # 校验一组目录两两独立；用于多目录合并和多目标参考模式。
 function Test-IndependentDirectorySet {
     param(
@@ -428,7 +547,7 @@ function Test-IndependentDirectorySet {
 # ========== 哈希与重复文件识别 ==========
 
 # 计算文件首尾片段的 SHA-256，用作快速筛选候选重复文件。
-function Get-SampleContentHash {
+function Get-PartialContentHash {
     param(
         [Parameter(Mandatory = $true)]
         [System.IO.FileInfo]$File
@@ -439,15 +558,15 @@ function Get-SampleContentHash {
 
     try {
         # 这里只做快速预筛选；真正删除前仍会使用完整 SHA-256 确认。
-        $hashBuffer = [byte[]]::new($SampleHashByteCount)
+        $hashBuffer = [byte[]]::new($PartialHashSegmentByteCount)
 
         $firstRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
         if ($firstRead -gt 0) {
             [void]$sha256.TransformBlock($hashBuffer, 0, $firstRead, $null, 0)
         }
 
-        if ($File.Length -gt $SampleHashByteCount) {
-            $tailOffset = [Math]::Max(0, $File.Length - $SampleHashByteCount)
+        if ($File.Length -gt $PartialHashSegmentByteCount) {
+            $tailOffset = [Math]::Max(0, $File.Length - $PartialHashSegmentByteCount)
             [void]$fileStream.Seek($tailOffset, [System.IO.SeekOrigin]::Begin)
             $lastRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
             if ($lastRead -gt 0) {
@@ -681,23 +800,23 @@ function Find-DuplicateFileGroups {
             }
         }
     )
-    $sampleCandidateCount = @($sameLengthGroups | ForEach-Object { $_.Group }).Count
-    Write-StageMessage "$($ProgressLabel)大小相同的候选文件数: $sampleCandidateCount，候选大小组数: $($sameLengthGroups.Count)"
+    $partialHashCandidateCount = @($sameLengthGroups | ForEach-Object { $_.Group }).Count
+    Write-StageMessage "$($ProgressLabel)大小相同的候选文件数: $partialHashCandidateCount，候选大小组数: $($sameLengthGroups.Count)"
 
-    $processedSampleHashCount = 0
-    $lastSampleHashPercent = -1
+    $processedPartialHashCount = 0
+    $lastPartialHashPercent = -1
     $hashProgressName = "$($ProgressLabel)哈希计算"
 
     foreach ($sizeGroup in $sameLengthGroups) {
-        $sampleHashRecords = @(
+        $partialHashRecords = @(
             foreach ($file in $sizeGroup.Group) {
-                $processedSampleHashCount++
-                Write-ProgressBar -Activity $hashProgressName -Status '正在筛选候选文件' -ProcessedCount $processedSampleHashCount -TotalCount $sampleCandidateCount -LastPercent ([ref]$lastSampleHashPercent)
+                $processedPartialHashCount++
+                Write-ProgressBar -Activity $hashProgressName -Status '正在筛选候选文件' -ProcessedCount $processedPartialHashCount -TotalCount $partialHashCandidateCount -LastPercent ([ref]$lastPartialHashPercent)
 
                 try {
                     [pscustomobject]@{
                         File        = $file
-                        SampleHash = Get-SampleContentHash -File $file
+                        PartialHash = Get-PartialContentHash -File $file
                     }
                 }
                 catch {
@@ -707,22 +826,22 @@ function Find-DuplicateFileGroups {
             }
         )
 
-        $sampleHashGroups = @($sampleHashRecords |
-            Group-Object -Property SampleHash |
+        $partialHashGroups = @($partialHashRecords |
+            Group-Object -Property PartialHash |
             Where-Object { $_.Count -gt 1 })
 
-        foreach ($sampleHashGroup in $sampleHashGroups) {
+        foreach ($partialHashGroup in $partialHashGroups) {
             # 部分哈希只用于减少候选范围，最终仍按完整 SHA-256 分组确认。
             $contentHashRecords = @(
-                foreach ($sampleHashRecord in $sampleHashGroup.Group) {
+                foreach ($partialHashRecord in $partialHashGroup.Group) {
                     try {
                         [pscustomobject]@{
-                            File     = $sampleHashRecord.File
-                            ContentHash = Get-FullContentHash -File $sampleHashRecord.File
+                            File        = $partialHashRecord.File
+                            ContentHash = Get-FullContentHash -File $partialHashRecord.File
                         }
                     }
                     catch {
-                        Write-Host "跳过文件，无法计算完整哈希: $($sampleHashRecord.File.FullName)" -ForegroundColor Yellow
+                        Write-Host "跳过文件，无法计算完整哈希: $($partialHashRecord.File.FullName)" -ForegroundColor Yellow
                         Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
                     }
                 }
@@ -969,15 +1088,54 @@ function Remove-DeletionItems {
     }
 }
 
-# 输出操作菜单并读取用户选择。
-function Read-DeletionAction {
+# 执行默认删除计划并输出统一的删除汇总。
+function Invoke-DefaultDeletionPlan {
     param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$DeletionPlanList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SummaryFormat
+    )
+
+    $deletionResult = Remove-DeletionItems -DeletionItemList @($DeletionPlanList | ForEach-Object { $_.DeletionItems })
+    Write-StatusSummary -Message ($SummaryFormat -f $deletionResult.DeletedCount) -Color Magenta
+    if ($deletionResult.FailedCount -gt 0) {
+        Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
+    }
+
+    return $deletionResult
+}
+
+# 生成删除操作菜单选项；参考目录模式不提供手动删除。
+function New-DeletionActionMenuOptions {
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$IncludeManualDeletion
+    )
+
+    $menuOptionList = New-Object System.Collections.Generic.List[object]
+    $menuOptionList.Add([pscustomobject]@{ Value = '1'; Label = '默认删除' })
+    if ($IncludeManualDeletion) {
+        $menuOptionList.Add([pscustomobject]@{ Value = '2'; Label = '手动删除' })
+    }
+    $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '退出' })
+
+    return $menuOptionList.ToArray()
+}
+
+# 输出通用菜单并读取用户选择。
+function Read-MenuChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
+
         [Parameter(Mandatory = $true)]
         [object[]]$MenuOptionList
     )
 
     Write-Host ""
-    Write-Host "请选择操作:" -ForegroundColor Cyan
+    Write-Host $Title -ForegroundColor Cyan
     foreach ($menuOption in $MenuOptionList) {
         Write-Host -NoNewline "  $($menuOption.Value) " -ForegroundColor Cyan
         Write-Host $menuOption.Label
@@ -991,6 +1149,33 @@ function Read-DeletionAction {
         }
 
         Write-Host "输入无效，请输入: $($validMenuChoices -join ', ')" -ForegroundColor Red
+    }
+}
+
+# 输出操作菜单并读取用户选择。
+function Read-DeletionAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$MenuOptionList
+    )
+
+    return Read-MenuChoice -Title '请选择操作:' -MenuOptionList $MenuOptionList
+}
+
+# 无路径且未指定模式时，先让用户选择扫描模式，避免默认落入单目录模式造成误解。
+function Read-InteractiveScanMode {
+    $modeChoice = Read-MenuChoice -Title '请选择扫描模式:' -MenuOptionList @(
+        [pscustomobject]@{ Value = '1'; Label = '单目录模式（一个或多个目录分别扫描）' }
+        [pscustomobject]@{ Value = '2'; Label = '多目录合并模式（多个目录视作一个大目录）' }
+        [pscustomobject]@{ Value = '3'; Label = '参考目录模式（第一个目录为参考目录）' }
+        [pscustomobject]@{ Value = '0'; Label = '退出' }
+    )
+
+    switch ($modeChoice) {
+        '1' { return 'Single' }
+        '2' { return 'Aggregate' }
+        '3' { return 'Reference' }
+        '0' { return 'Exit' }
     }
 }
 
@@ -1170,20 +1355,12 @@ function Invoke-SingleDirectoryMode {
             return
         }
 
-        $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-        Write-StatusSummary -Message "删除完成。已删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-        if ($deletionResult.FailedCount -gt 0) {
-            Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-        }
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
         return
     }
 
     [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList @(
-        [pscustomobject]@{ Value = '1'; Label = '默认删除' }
-        [pscustomobject]@{ Value = '2'; Label = '手动删除' }
-        [pscustomobject]@{ Value = '0'; Label = '退出' }
-    )
+    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions -IncludeManualDeletion)
 
     if ($menuChoice -eq '0') {
         Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
@@ -1191,11 +1368,7 @@ function Invoke-SingleDirectoryMode {
     }
 
     if ($menuChoice -eq '1') {
-        $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-        Write-StatusSummary -Message "删除完成。已删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-        if ($deletionResult.FailedCount -gt 0) {
-            Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-        }
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
         return
     }
 
@@ -1240,20 +1413,12 @@ function Invoke-MergedDirectoryMode {
             return
         }
 
-        $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-        Write-StatusSummary -Message "删除完成。已从多目录合并结果中删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-        if ($deletionResult.FailedCount -gt 0) {
-            Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-        }
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从多目录合并结果中删除重复文件: {0}')
         return
     }
 
     [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划从多目录合并结果中删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList @(
-        [pscustomobject]@{ Value = '1'; Label = '默认删除' }
-        [pscustomobject]@{ Value = '2'; Label = '手动删除' }
-        [pscustomobject]@{ Value = '0'; Label = '退出' }
-    )
+    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions -IncludeManualDeletion)
 
     if ($menuChoice -eq '0') {
         Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
@@ -1261,11 +1426,7 @@ function Invoke-MergedDirectoryMode {
     }
 
     if ($menuChoice -eq '1') {
-        $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-        Write-StatusSummary -Message "删除完成。已从多目录合并结果中删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-        if ($deletionResult.FailedCount -gt 0) {
-            Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-        }
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从多目录合并结果中删除重复文件: {0}')
         return
     }
 
@@ -1273,164 +1434,270 @@ function Invoke-MergedDirectoryMode {
     Invoke-ManualDeletion -DeletionPlanList $deletionPlanList -DisplayPathByFullName $displayPathByFullName
 }
 
+# 为参考目录模式建立轻量参考索引；这里只按文件大小分组，不读取文件内容。
+function New-ReferenceDirectoryIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReferenceRootPath
+    )
+
+    $referenceFileList = @(Get-ScannedFiles -RootPath $ReferenceRootPath -ProgressLabel '参考目录')
+    $referenceFilesByLength = @{}
+    $indexedReferenceFileCount = 0
+
+    if ($referenceFileList.Count -gt 0) {
+        Write-StageMessage "参考目录模式构建文件大小索引..."
+        $processedReferenceFileCount = 0
+        $lastReferenceLengthPercent = -1
+        foreach ($file in $referenceFileList) {
+            $processedReferenceFileCount++
+            Write-ProgressBar -Activity '参考目录大小索引' -Status '正在按文件大小归类' -ProcessedCount $processedReferenceFileCount -TotalCount $referenceFileList.Count -LastPercent ([ref]$lastReferenceLengthPercent)
+
+            if (-not $referenceFilesByLength.ContainsKey($file.Length)) {
+                $referenceFilesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            }
+            $referenceFilesByLength[$file.Length].Add($file)
+            $indexedReferenceFileCount++
+        }
+        Complete-ProgressBar
+        Write-StageMessage "参考目录大小索引完成，已索引文件数: $indexedReferenceFileCount"
+    }
+
+    return [pscustomobject]@{
+        RootPath            = $ReferenceRootPath
+        PathPrefix          = Get-DirectoryLabel -RootPath $ReferenceRootPath
+        FileList            = $referenceFileList
+        FilesByLength       = $referenceFilesByLength
+        PartialHashIndexByLength = @{}
+        FullHashIndexCache       = @{}
+        PartialHashByFullName    = @{}
+        FullHashByFullName       = @{}
+        IndexedFileCount         = $indexedReferenceFileCount
+    }
+}
+
+# 按参考文件完整路径缓存部分哈希，避免同一次运行中同一文件重复计算。
+function Get-CachedReferencePartialHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    if ($ReferenceIndex.PartialHashByFullName.ContainsKey($File.FullName)) {
+        return $ReferenceIndex.PartialHashByFullName[$File.FullName]
+    }
+
+    $partialHash = Get-PartialContentHash -File $File
+    $ReferenceIndex.PartialHashByFullName[$File.FullName] = $partialHash
+    return $partialHash
+}
+
+# 按参考文件完整路径缓存完整哈希，避免同一次运行中同一文件重复计算。
+function Get-CachedReferenceFullHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    if ($ReferenceIndex.FullHashByFullName.ContainsKey($File.FullName)) {
+        return $ReferenceIndex.FullHashByFullName[$File.FullName]
+    }
+
+    $fullHash = Get-FullContentHash -File $File
+    $ReferenceIndex.FullHashByFullName[$File.FullName] = $fullHash
+    return $fullHash
+}
+
+# 按需为参考目录中的某个文件大小组建立部分哈希索引，并缓存结果供后续目标目录复用。
+function Get-ReferencePartialHashIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Length
+    )
+
+    if ($ReferenceIndex.PartialHashIndexByLength.ContainsKey($Length)) {
+        return $ReferenceIndex.PartialHashIndexByLength[$Length]
+    }
+
+    $partialHashIndex = @{}
+    if (-not $ReferenceIndex.FilesByLength.ContainsKey($Length)) {
+        $ReferenceIndex.PartialHashIndexByLength[$Length] = $partialHashIndex
+        return $partialHashIndex
+    }
+
+    $referenceFiles = @($ReferenceIndex.FilesByLength[$Length])
+    foreach ($referenceFile in $referenceFiles) {
+        try {
+            $partialHash = Get-CachedReferencePartialHash -ReferenceIndex $ReferenceIndex -File $referenceFile
+            if (-not $partialHashIndex.ContainsKey($partialHash)) {
+                $partialHashIndex[$partialHash] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            }
+            $partialHashIndex[$partialHash].Add($referenceFile)
+        }
+        catch {
+            Write-Host "跳过参考文件，无法计算部分哈希: $($referenceFile.FullName)" -ForegroundColor Yellow
+            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+
+    $ReferenceIndex.PartialHashIndexByLength[$Length] = $partialHashIndex
+    return $partialHashIndex
+}
+
+# 按需为参考目录中的某个“文件大小 + 部分哈希”组建立完整哈希索引，并缓存结果供后续目标目录复用。
+function Get-ReferenceFullHashIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Length,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PartialHash
+    )
+
+    if (-not $ReferenceIndex.FullHashIndexCache.ContainsKey($Length)) {
+        $ReferenceIndex.FullHashIndexCache[$Length] = @{}
+    }
+
+    $fullHashCacheByPartialHash = $ReferenceIndex.FullHashIndexCache[$Length]
+    if ($fullHashCacheByPartialHash.ContainsKey($PartialHash)) {
+        return $fullHashCacheByPartialHash[$PartialHash]
+    }
+
+    $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $Length
+    $fullHashIndex = @{}
+    if (-not $partialHashIndex.ContainsKey($PartialHash)) {
+        $fullHashCacheByPartialHash[$PartialHash] = $fullHashIndex
+        return $fullHashIndex
+    }
+
+    $referenceFiles = @($partialHashIndex[$PartialHash])
+    foreach ($referenceFile in $referenceFiles) {
+        try {
+            $fullHash = Get-CachedReferenceFullHash -ReferenceIndex $ReferenceIndex -File $referenceFile
+            if (-not $fullHashIndex.ContainsKey($fullHash)) {
+                $fullHashIndex[$fullHash] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            }
+            $fullHashIndex[$fullHash].Add($referenceFile)
+        }
+        catch {
+            Write-Host "跳过参考文件，无法计算完整哈希: $($referenceFile.FullName)" -ForegroundColor Yellow
+            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+
+    $fullHashCacheByPartialHash[$PartialHash] = $fullHashIndex
+    return $fullHashIndex
+}
+
 # 为参考目录模式生成删除计划：参考目录只参与比较，目标目录才会进入删除列表。
 function New-ReferenceDirectoryDeletionPlan {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ReferenceRootPath,
+        [object]$ReferenceIndex,
 
         [Parameter(Mandatory = $true)]
         [string]$TargetRootPath
     )
 
-    $referenceFileList = @(Get-ScannedFiles -RootPath $ReferenceRootPath -ProgressLabel '参考目录')
+    $referenceFileList = @($ReferenceIndex.FileList)
     $targetFileList = @(Get-ScannedFiles -RootPath $TargetRootPath -ProgressLabel '目标目录')
-    if ($referenceFileList.Count -eq 0 -or $targetFileList.Count -eq 0) {
+    if ($referenceFileList.Count -eq 0 -or $ReferenceIndex.IndexedFileCount -eq 0 -or $targetFileList.Count -eq 0) {
         return @()
     }
 
-    $referencePathPrefix = Get-DirectoryLabel -RootPath $ReferenceRootPath
+    $referenceRootPath = $ReferenceIndex.RootPath
+    $referencePathPrefix = $ReferenceIndex.PathPrefix
+    $referenceFilesByLength = $ReferenceIndex.FilesByLength
     $targetPathPrefix = Get-DirectoryLabel -RootPath $TargetRootPath
 
-    # 只用参考目录建立查找表；实际删除计划只从目标目录文件生成。
-    $referenceFilesByLength = @{}
-    $processedReferenceFileCount = 0
-    $lastReferenceLengthPercent = -1
-    foreach ($file in $referenceFileList) {
-        $processedReferenceFileCount++
-        Write-ProgressBar -Activity '参考目录文件大小分组' -Status '正在建立参考目录索引' -ProcessedCount $processedReferenceFileCount -TotalCount $referenceFileList.Count -LastPercent ([ref]$lastReferenceLengthPercent)
-
-        if (-not $referenceFilesByLength.ContainsKey($file.Length)) {
-            $referenceFilesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-        }
-        $referenceFilesByLength[$file.Length].Add($file)
-    }
-    Complete-ProgressBar
-
-    Write-StageMessage "参考目录模式按文件大小筛选目标目录候选文件..."
-    $targetCandidatesByLength = @{}
+    Write-StageMessage "参考目录模式使用懒加载索引筛选目标目录..."
+    $matchedTargetFilesByHash = @{}
     $processedTargetFileCount = 0
-    $lastTargetLengthPercent = -1
+    $lastTargetMatchPercent = -1
     foreach ($file in $targetFileList) {
         $processedTargetFileCount++
-        Write-ProgressBar -Activity '目标目录文件大小筛选' -Status '正在查找大小匹配文件' -ProcessedCount $processedTargetFileCount -TotalCount $targetFileList.Count -LastPercent ([ref]$lastTargetLengthPercent)
+        Write-ProgressBar -Activity '目标目录重复文件筛选' -Status '正在匹配参考目录索引' -ProcessedCount $processedTargetFileCount -TotalCount $targetFileList.Count -LastPercent ([ref]$lastTargetMatchPercent)
 
         # 目标文件只有在参考目录存在相同大小文件时，才需要进入后续哈希比较。
-        if ($referenceFilesByLength.ContainsKey($file.Length)) {
-            if (-not $targetCandidatesByLength.ContainsKey($file.Length)) {
-                $targetCandidatesByLength[$file.Length] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-            }
-            $targetCandidatesByLength[$file.Length].Add($file)
+        if (-not $referenceFilesByLength.ContainsKey($file.Length)) {
+            continue
         }
-    }
-    Complete-ProgressBar
 
-    $targetCandidateLengthGroups = @(
-        foreach ($size in $targetCandidatesByLength.Keys) {
-            [pscustomobject]@{
-                Name  = $size
-                Count = $targetCandidatesByLength[$size].Count
-                Group = @($targetCandidatesByLength[$size])
-            }
+        try {
+            $partialHash = Get-PartialContentHash -File $file
         }
-    )
-    $targetCandidateFileCount = @($targetCandidateLengthGroups | ForEach-Object { $_.Group }).Count
-    Write-StageMessage "目标目录大小匹配候选文件数: $targetCandidateFileCount，候选大小组数: $($targetCandidateLengthGroups.Count)"
-    Write-StageMessage "参考目录哈希阶段会同时计算参考目录候选文件和目标目录候选文件。"
+        catch {
+            Write-Host "跳过文件，无法计算部分哈希: $($file.FullName)" -ForegroundColor Yellow
+            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            continue
+        }
 
-    $comparisonFileCount = 0
-    foreach ($targetLengthGroup in $targetCandidateLengthGroups) {
-        $comparisonFileCount += @($referenceFilesByLength[[int64]$targetLengthGroup.Name]).Count + $targetLengthGroup.Group.Count
-    }
+        $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length
+        if (-not $partialHashIndex.ContainsKey($partialHash)) {
+            continue
+        }
 
-    $processedSampleHashCount = 0
-    $lastSampleHashPercent = -1
-    $hashProgressName = '参考目录哈希计算'
+        $fullHashIndex = Get-ReferenceFullHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -PartialHash $partialHash
+        if ($fullHashIndex.Count -eq 0) {
+            continue
+        }
 
-    foreach ($targetLengthGroup in $targetCandidateLengthGroups) {
-        $sameLengthReferenceFiles = @($referenceFilesByLength[[int64]$targetLengthGroup.Name])
-        $comparisonFileRecords = @(
-            $sameLengthReferenceFiles | ForEach-Object {
-                [pscustomobject]@{
-                    File = $_
-                    Side = 'Reference'
-                }
-            }
+        try {
+            $fullHash = Get-FullContentHash -File $file
+        }
+        catch {
+            Write-Host "跳过文件，无法计算完整哈希: $($file.FullName)" -ForegroundColor Yellow
+            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            continue
+        }
 
-            $targetLengthGroup.Group | ForEach-Object {
-                [pscustomobject]@{
-                    File = $_
-                    Side = 'Target'
-                }
-            }
-        )
+        if (-not $fullHashIndex.ContainsKey($fullHash)) {
+            continue
+        }
 
-        $sampleHashRecords = @(
-            foreach ($comparisonFileRecord in $comparisonFileRecords) {
-                $processedSampleHashCount++
-                Write-ProgressBar -Activity $hashProgressName -Status '正在比较参考目录和目标目录' -ProcessedCount $processedSampleHashCount -TotalCount $comparisonFileCount -LastPercent ([ref]$lastSampleHashPercent)
-
-                try {
-                    [pscustomobject]@{
-                        File        = $comparisonFileRecord.File
-                        Side        = $comparisonFileRecord.Side
-                        SampleHash = Get-SampleContentHash -File $comparisonFileRecord.File
-                    }
-                }
-                catch {
-                    Write-Host "跳过文件，无法计算部分哈希: $($comparisonFileRecord.File.FullName)" -ForegroundColor Yellow
-                    Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
-                }
-            }
-        )
-
-        $sampleHashGroups = @($sampleHashRecords |
-            Group-Object -Property SampleHash |
-            Where-Object {
-                @($_.Group | Where-Object { $_.Side -eq 'Reference' }).Count -gt 0 -and
-                @($_.Group | Where-Object { $_.Side -eq 'Target' }).Count -gt 0
-            })
-
-        foreach ($sampleHashGroup in $sampleHashGroups) {
-            # 只有同一完整哈希里同时存在参考文件和目标文件时，才生成目标目录删除计划。
-            $contentHashRecords = @(
-                foreach ($sampleHashRecord in $sampleHashGroup.Group) {
-                    try {
-                        [pscustomobject]@{
-                            File     = $sampleHashRecord.File
-                            Side     = $sampleHashRecord.Side
-                            ContentHash = Get-FullContentHash -File $sampleHashRecord.File
-                        }
-                    }
-                    catch {
-                        Write-Host "跳过文件，无法计算完整哈希: $($sampleHashRecord.File.FullName)" -ForegroundColor Yellow
-                        Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
-                    }
-                }
-            )
-
-            $contentHashGroups = @($contentHashRecords |
-                Group-Object -Property ContentHash |
-                Where-Object {
-                    @($_.Group | Where-Object { $_.Side -eq 'Reference' }).Count -gt 0 -and
-                    @($_.Group | Where-Object { $_.Side -eq 'Target' }).Count -gt 0
-                })
-
-            foreach ($contentHashGroup in $contentHashGroups) {
-                $matchingReferenceFiles = @($contentHashGroup.Group | Where-Object { $_.Side -eq 'Reference' } | ForEach-Object { $_.File })
-                $referenceKeepFile = Select-DefaultKeepFile -FileList $matchingReferenceFiles
-                $matchingTargetFiles = @($contentHashGroup.Group | Where-Object { $_.Side -eq 'Target' } | ForEach-Object { $_.File })
-
-                [pscustomobject]@{
-                    Hash          = $contentHashGroup.Name
-                    KeepPathText = Get-RelativePathText -File $referenceKeepFile -RootPath $ReferenceRootPath -PathPrefix $referencePathPrefix
-                    DeletionItems = New-DeletionItems -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
-                }
+        if (-not $matchedTargetFilesByHash.ContainsKey($fullHash)) {
+            $targetFileListForHash = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            $matchedTargetFilesByHash[$fullHash] = [pscustomobject]@{
+                Hash           = $fullHash
+                ReferenceFiles = @($fullHashIndex[$fullHash])
+                TargetFiles    = $targetFileListForHash
             }
         }
+
+        $matchedTargetFilesByHash[$fullHash].TargetFiles.Add($file)
     }
 
     Complete-ProgressBar
+
+    $matchedTargetFileCount = 0
+    foreach ($matchRecord in $matchedTargetFilesByHash.Values) {
+        $matchedTargetFileCount += $matchRecord.TargetFiles.Count
+    }
+    Write-StageMessage "目标目录匹配参考目录的重复文件数: $matchedTargetFileCount，完整哈希组数: $($matchedTargetFilesByHash.Count)"
+
+    foreach ($matchRecord in $matchedTargetFilesByHash.Values) {
+        $matchingReferenceFiles = @($matchRecord.ReferenceFiles)
+        $referenceKeepFile = Select-DefaultKeepFile -FileList $matchingReferenceFiles
+        $matchingTargetFiles = @($matchRecord.TargetFiles)
+
+        [pscustomobject]@{
+            Hash          = $matchRecord.Hash
+            KeepPathText = Get-RelativePathText -File $referenceKeepFile -RootPath $referenceRootPath -PathPrefix $referencePathPrefix
+            DeletionItems = New-DeletionItems -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
+        }
+    }
 }
 
 # 参考目录去重入口：以第一个目录为参考，只删除后续目标目录中的重复文件。
@@ -1443,6 +1710,12 @@ function Invoke-ReferenceDirectoryMode {
         [string[]]$TargetRootPathList
     )
 
+    $referenceIndex = New-ReferenceDirectoryIndex -ReferenceRootPath $ReferenceRootPath
+    if (@($referenceIndex.FileList).Count -eq 0) {
+        Write-Host "未发现目标目录中存在与参考目录重复的文件。" -ForegroundColor Green
+        return
+    }
+
     $deletionPlanList = @(
         for ($targetIndex = 0; $targetIndex -lt $TargetRootPathList.Count; $targetIndex++) {
             if ($TargetRootPathList.Count -gt 1) {
@@ -1450,7 +1723,7 @@ function Invoke-ReferenceDirectoryMode {
                 Write-Host "参考目录模式目标 $($targetIndex + 1) / $($TargetRootPathList.Count): $($TargetRootPathList[$targetIndex])" -ForegroundColor Cyan
             }
 
-            New-ReferenceDirectoryDeletionPlan -ReferenceRootPath $ReferenceRootPath -TargetRootPath $TargetRootPathList[$targetIndex]
+            New-ReferenceDirectoryDeletionPlan -ReferenceIndex $referenceIndex -TargetRootPath $TargetRootPathList[$targetIndex]
         }
     )
 
@@ -1464,30 +1737,19 @@ function Invoke-ReferenceDirectoryMode {
             return
         }
 
-        $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-        Write-StatusSummary -Message "删除完成。已从目标目录删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-        if ($deletionResult.FailedCount -gt 0) {
-            Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-        }
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从目标目录删除重复文件: {0}')
         return
     }
 
     [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划从目标目录删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList @(
-        [pscustomobject]@{ Value = '1'; Label = '默认删除' }
-        [pscustomobject]@{ Value = '0'; Label = '退出' }
-    )
+    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions)
 
     if ($menuChoice -eq '0') {
         Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
         return
     }
 
-    $deletionResult = Remove-DeletionItems -DeletionItemList @($deletionPlanList | ForEach-Object { $_.DeletionItems })
-    Write-StatusSummary -Message "删除完成。已从目标目录删除重复文件: $($deletionResult.DeletedCount)" -Color Magenta
-    if ($deletionResult.FailedCount -gt 0) {
-        Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
-    }
+    [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从目标目录删除重复文件: {0}')
 }
 
 if ($Help) {
@@ -1500,18 +1762,37 @@ if ($AggregateMode -and $ReferenceMode) {
     exit 1
 }
 
-$minimumPathCount = if ($ReferenceMode) { 2 } else { 1 }
-$modeName = if ($ReferenceMode) {
+$useAggregateMode = [bool]$AggregateMode
+$useReferenceMode = [bool]$ReferenceMode
+$inputPathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+if ($inputPathList.Count -eq 0 -and -not $useAggregateMode -and -not $useReferenceMode) {
+    $selectedScanMode = Read-InteractiveScanMode
+    switch ($selectedScanMode) {
+        'Aggregate' {
+            $useAggregateMode = $true
+        }
+        'Reference' {
+            $useReferenceMode = $true
+        }
+        'Exit' {
+            Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+            exit 0
+        }
+    }
+}
+
+$minimumPathCount = if ($useReferenceMode) { 2 } else { 1 }
+$modeName = if ($useReferenceMode) {
     '参考目录模式'
 }
-elseif ($AggregateMode) {
+elseif ($useAggregateMode) {
     '多目录合并模式'
 }
 else {
     '单目录模式'
 }
 
-$inputPathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 if ($inputPathList.Count -eq 0) {
     $inputPathList = @(Read-InteractivePathList -ModeName $modeName -MinimumCount $minimumPathCount)
 }
@@ -1529,7 +1810,7 @@ catch {
     exit 1
 }
 
-if ($ReferenceMode -or $AggregateMode) {
+if ($useReferenceMode -or $useAggregateMode) {
     try {
         Test-IndependentDirectorySet -RootPathList $resolvedPathList
     }
@@ -1538,11 +1819,20 @@ if ($ReferenceMode -or $AggregateMode) {
         exit 1
     }
 }
+else {
+    try {
+        Test-UniqueDirectorySet -RootPathList $resolvedPathList
+    }
+    catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        exit 1
+    }
+}
 
-if ($ReferenceMode) {
+if ($useReferenceMode) {
     Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList @($resolvedPathList | Select-Object -Skip 1)
 }
-elseif ($AggregateMode) {
+elseif ($useAggregateMode) {
     Invoke-MergedDirectoryMode -RootPathList $resolvedPathList
 }
 else {

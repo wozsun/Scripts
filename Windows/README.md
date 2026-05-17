@@ -2,25 +2,19 @@
 
 这个文件夹用于存放 Windows 平台可用的 PowerShell 脚本。
 
-## Remove-DuplicateFiles.ps1
+## Convert-OfficeFiles.ps1
 
-`Remove-DuplicateFiles.ps1` 用于查找内容完全相同的文件，并删除重复文件。
+`Convert-OfficeFiles.ps1` 用于调用本机 Office 原生应用，将指定文件夹下的 `.doc`、`.xls`、`.ppt` 转换为 `.docx`、`.xlsx`、`.pptx`。
 
-脚本需要 PowerShell 7，可使用 `-h` 查看帮助信息。无参数直接执行时，脚本会引导输入要扫描的目录。默认只扫描未隐藏文件和文件夹；如需包含隐藏项，传入 `-s`。如需跳过预览和菜单并直接执行默认删除计划，传入 `-yes`。
-
-脚本支持两种模式：
-
-- 单目录模式：只传入 `PathA`，在同一目录内查找重复文件。
-- 参考目录模式：同时传入 `PathA` 和 `PathB`，以 `PathA` 为参考目录，只删除 `PathB` 中与参考目录重复的文件。
+脚本需要 PowerShell 7 和本机已安装的桌面版 Office。脚本默认保留原始文件；如果目标新格式文件已经存在，会提示并跳过，不会覆盖。脚本只创建新格式文件，不需要预览确认。
 
 ### 参数说明
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `PathA` | 是 | 无 | 要扫描的文件夹绝对路径；当同时提供 `PathB` 时，表示参考目录。 |
-| `PathB` | 否 | 无 | 目标文件夹绝对路径。只有这个目录中的重复文件可能会被删除。 |
+| `Path` | 是 | 无 | 要扫描的文件夹绝对路径。 |
 | `-s` | 否 | 关闭 | 包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。 |
-| `-yes` | 否 | 关闭 | 跳过预览和菜单，直接执行默认删除计划。 |
+| `-MoveDelayMilliseconds` | 否 | `200` | Office 退出后，移动每个转换结果前等待的毫秒数；传入 `0` 表示不等待。 |
 | `-h` | 否 | 关闭 | 显示帮助信息。 |
 
 ### 使用示例
@@ -28,34 +22,114 @@
 查看帮助信息：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 -h
+pwsh -File .\Convert-OfficeFiles.ps1 -h
 ```
 
-单目录模式：
+转换指定文件夹下的旧格式 Office 文件：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\Folder"
+pwsh -File .\Convert-OfficeFiles.ps1 "C:\Path\Folder"
 ```
 
 包含隐藏文件和隐藏文件夹：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 -s "C:\Path\Folder"
+pwsh -File .\Convert-OfficeFiles.ps1 -s "C:\Path\Folder"
+```
+
+调整统一移动阶段的单文件延时：
+
+```powershell
+pwsh -File .\Convert-OfficeFiles.ps1 -MoveDelayMilliseconds 500 "C:\Path\Folder"
+```
+
+### 注意事项
+
+- 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Documents`；交互输入时可以粘贴带首尾引号的路径。
+- 脚本使用 Word、Excel、PowerPoint 的原生 COM 自动化能力，需要本机安装桌面版 Office。
+- 脚本默认保留原始 `.doc`、`.xls`、`.ppt` 文件。
+- 脚本只创建新格式文件，不删除、移动或覆盖原始文件，因此不会展示预览菜单。
+- 如果目标 `.docx`、`.xlsx`、`.pptx` 已存在，脚本会跳过，不覆盖。
+- `.xls` 转 `.xlsx` 不会保留宏；如果需要保留宏，应另行转换为 `.xlsm`。
+- 有密码、损坏、受保护视图、外部链接或需要人工确认的文件可能转换失败。
+- 每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
+- 转换时会在目标目录下创建 `.convert-officefiles-tmp\<本次运行ID>` 专属临时子文件夹保存临时文件；全部文件转换完成并退出 Office 后，再统一移动到目标位置。
+- 统一移动阶段会显示百分比进度条，每个文件移动前默认等待 `200ms`，可通过 `-MoveDelayMilliseconds` 调整。
+- 移动完成后脚本会自动清理本次运行创建的临时文件和空的专属临时文件夹。
+- 转换过程会启动 Office 应用实例，转换完成后脚本会自动退出这些实例。
+
+### 执行流程
+
+脚本会先扫描并输出转换计划摘要，然后把所有目标不存在的旧格式文件转换到 `.convert-officefiles-tmp\<本次运行ID>` 专属临时子文件夹。全部转换完成后，脚本会退出 Office 应用实例，再统一移动临时文件到目标位置。目标文件已存在时会逐条提示并跳过。
+
+## Remove-DuplicateFiles.ps1
+
+`Remove-DuplicateFiles.ps1` 用于查找内容完全相同的文件，并删除重复文件。
+
+脚本需要 PowerShell 7，可使用 `-h` 查看帮助信息。无参数直接执行时，脚本会引导输入一个或多个目录，并按单目录模式逐个扫描。默认只扫描未隐藏文件和文件夹；如需包含隐藏项，传入 `-s`。如需跳过预览和菜单并执行默认删除计划，传入 `-yes`；脚本会先显示 10 秒倒计时，期间可按 `Enter` 取消，也可按 `Ctrl+C` 强制中止。
+
+脚本支持三种模式：
+
+- 单目录模式：不传入 `-a` 或 `-c` 时启用；可以输入一个或多个目录，每个目录单独扫描和处理。
+- 多目录合并模式：传入 `-a` 时启用；把多个目录抽象为一个大目录，可查找跨目录重复文件。
+- 参考目录模式：传入 `-c` 时启用；第一个目录为参考目录，后面的目录为目标目录，只删除目标目录中与参考目录重复的文件。
+
+### 参数说明
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `Path` | 否 | 无 | 一个或多个文件夹绝对路径；无参数时会交互输入。 |
+| `-a` | 否 | 关闭 | 多目录合并模式，把所有输入目录视作一个虚拟大目录扫描。 |
+| `-c` | 否 | 关闭 | 参考目录模式，第一个目录为参考目录，其余目录为目标目录。 |
+| `-s` | 否 | 关闭 | 包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。 |
+| `-yes` | 否 | 关闭 | 跳过预览和菜单，等待 10 秒后执行默认删除计划；倒计时期间可按 `Enter` 取消，也可按 `Ctrl+C` 强制中止。 |
+| `-h` | 否 | 关闭 | 显示帮助信息。 |
+
+### 使用示例
+
+查看帮助信息：
+
+```powershell
+pwsh -File .\Remove-DuplicateFiles.ps1 -h
+```
+
+单目录模式：
+
+```powershell
+pwsh -File .\Remove-DuplicateFiles.ps1 "C:\Path\Folder"
+```
+
+多个目录分别执行单目录模式：
+
+```powershell
+pwsh -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\Path\B"
+```
+
+包含隐藏文件和隐藏文件夹：
+
+```powershell
+pwsh -File .\Remove-DuplicateFiles.ps1 -s "C:\Path\Folder"
 ```
 
 跳过预览并直接执行默认删除：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 -yes "C:\Path\Folder"
+pwsh -File .\Remove-DuplicateFiles.ps1 -yes "C:\Path\Folder"
+```
+
+多目录合并模式：
+
+```powershell
+pwsh -File .\Remove-DuplicateFiles.ps1 -a "C:\Path\A" "C:\Path\B" "C:\Path\C"
 ```
 
 参考目录模式：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\Path\B"
+pwsh -File .\Remove-DuplicateFiles.ps1 -c "C:\Path\Reference" "C:\Path\TargetA" "C:\Path\TargetB"
 ```
 
-在这个例子中，`C:\Path\B` 中与 `C:\Path\A` 内容完全相同的文件会被删除；`C:\Path\A` 只作为参考目录，不会被修改或删除任何文件。
+在这个例子中，`C:\Path\TargetA` 和 `C:\Path\TargetB` 中与 `C:\Path\Reference` 内容完全相同的文件会被删除；`C:\Path\Reference` 只作为参考目录，不会被修改或删除任何文件。
 
 ### 注意事项
 
@@ -64,7 +138,10 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 - `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，仅用于需要 Windows PowerShell 5.1 的旧环境；该副本因 PowerShell 5.1 的中文 UTF-8 解析限制，使用 UTF-8 with BOM 保存。如需允许脚本执行，可先以管理员身份运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
 - 脚本会递归扫描子文件夹。
 - 默认不扫描隐藏文件和隐藏文件夹；如需包含隐藏项，请传入 `-s`。
-- `-yes` 会跳过预览和菜单，请只在确认默认删除规则符合预期时使用。
+- 不带 `-a` 或 `-c` 时，多个目录会分别执行单目录模式，而不是互相合并比对。
+- 多目录合并模式和参考目录模式要求输入目录互不包含；相同目录、父子目录或互相嵌套目录会被拒绝，避免同一文件被重复扫描后匹配到自身。
+- 参考目录模式必须显式传入 `-c`，且至少需要两个目录。
+- `-yes` 会跳过预览和菜单，并在执行默认删除前等待 10 秒；倒计时期间可按 `Enter` 取消，也可按 `Ctrl+C` 强制中止。请只在确认默认删除规则符合预期时使用。
 - 删除操作使用 `Remove-Item` 执行，是永久删除，不会进入回收站。
 - 脚本会在删除前自动展示预览并要求选择操作，除非传入 `-yes`。
 - 扫描时如果遇到无法访问的文件或目录，脚本会输出黄色跳过提示，并继续处理其他可访问内容。
@@ -77,13 +154,13 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 
 1. 先比较文件大小。
 2. 再比较文件的部分 SHA-256 哈希。
-3. 最后只对剩余候选文件计算完整 SHA-256 哈希。
+3. 最后只对剩余候选文件使用 .NET 流式读取计算完整 SHA-256 哈希。
 
 默认删除模式下，每组重复文件会保留文件名最短的文件。如果文件名长度相同，则继续按文件名和完整路径排序决定保留项。手动删除模式下，可以自行选择要删除的文件，只要每组至少保留一个文件即可。
 
 ### 交互流程
 
-单目录模式每次执行时都会先展示默认预览，然后提供操作选项：
+单目录模式和多目录合并模式每次执行时都会先展示默认预览，然后提供操作选项：
 
 ```text
 1 默认删除
@@ -93,7 +170,7 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 
 选择 `1` 时，脚本会按默认规则删除重复文件。选择 `2` 时，脚本会逐组列出重复文件编号，由你手动输入要删除的文件编号；多个编号可以用逗号分隔，例如 `2,3`。在手动选择时，直接回车会使用默认规则，输入 `0` 会跳过当前重复文件组，输入 `00` 会直接退出脚本，不再处理后续重复文件组；此前已经手动删除的文件不会恢复。
 
-传入 `-yes` 时，脚本会跳过预览和菜单，直接执行默认删除计划。
+传入 `-yes` 时，脚本会跳过预览和菜单，先显示 10 秒倒计时，再执行默认删除计划。倒计时期间可按 `Enter` 取消，也可按 `Ctrl+C` 强制中止。
 
 参考目录模式每次执行时都会先展示默认预览，然后提供操作选项：
 
@@ -102,7 +179,7 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 0 退出
 ```
 
-选择 `1` 时，脚本会删除预览列表中所有目标目录重复文件。选择 `0` 时，脚本会退出且不会删除任何文件。参考目录只用于比对和展示保留文件，不会被删除。
+选择 `1` 时，脚本会删除预览列表中所有目标目录重复文件。选择 `0` 时，脚本会退出且不会删除任何文件。参考目录只用于比对和展示保留文件，不会被删除，也不提供手动删除选项。
 
 脚本会用“重复文件列举完成”汇总预览结果，用“删除完成”汇总实际删除结果，便于区分当前阶段。
 
@@ -110,7 +187,7 @@ pwsh -ExecutionPolicy Bypass -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\P
 
 ### 预览输出
 
-预览输出会使用相对路径，避免完整绝对路径过长。双目录模式下会使用两个目录各自的最后一级名称作为前缀。
+预览输出会使用相对路径，避免完整绝对路径过长。多目录合并模式和参考目录模式下会使用目录最后一级名称作为前缀；多目录合并模式会额外加上目录序号，便于区分同名目录。
 
 预览会按 SHA-256 分组显示。每个重复文件组只显示一次哈希值，并在同一个块里列出保留文件和所有将删除的文件：
 

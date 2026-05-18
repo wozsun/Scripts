@@ -82,7 +82,7 @@ function Show-HelpText {
   pwsh -File .\Remove-DuplicateFiles.ps1 -h
 
 参数：
-  Path   文件夹绝对路径；不带 -a/-c 时，每个目录单独扫描。
+  Path   文件夹绝对路径；不带 -a/-c 时，多个目录先全部扫描，再逐个操作。
   -a     多目录合并模式，把多个目录视作一个大目录。
   -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
@@ -92,6 +92,7 @@ function Show-HelpText {
 说明：
   无路径且未指定 -a/-c 时，会先显示模式菜单。
   单目录和多目录合并模式可默认删除、手动删除或退出。
+  多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除或退出。
   交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请加引号。
 '@
@@ -952,7 +953,7 @@ function Read-ManualDeletionSelection {
     }
 
     while ($true) {
-        $manualInputText = Read-Host "请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出"
+        $manualInputText = Read-Host "请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出脚本"
         $trimmedInputText = $manualInputText.Trim()
 
         if ([string]::IsNullOrWhiteSpace($trimmedInputText)) {
@@ -1001,7 +1002,7 @@ function Read-ManualDeletionSelection {
         }
 
         if (-not $isValidSelection -or $selectedFileNumbers.Count -eq 0) {
-            Write-Host "输入无效，请输入列表中的编号，例如: 2 或 2,3；输入 0 跳过；输入 00 退出" -ForegroundColor Red
+            Write-Host "输入无效，请输入列表中的编号，例如: 2 或 2,3；输入 0 跳过；输入 00 退出脚本" -ForegroundColor Red
             continue
         }
 
@@ -1079,11 +1080,17 @@ function Invoke-DefaultDeletionPlan {
     return $deletionResult
 }
 
-# 生成删除操作菜单选项；参考目录模式不提供手动删除。
+# 生成删除操作菜单选项；多单目录操作时可把 0 作为跳过当前目录。
 function New-DeletionActionMenuOptions {
     param(
         [Parameter(Mandatory = $false)]
-        [switch]$IncludeManualDeletion
+        [switch]$IncludeManualDeletion,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IncludeSkipCurrentDirectory,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IncludeExitScript
     )
 
     $menuOptionList = [System.Collections.Generic.List[object]]::new()
@@ -1091,7 +1098,15 @@ function New-DeletionActionMenuOptions {
     if ($IncludeManualDeletion) {
         $menuOptionList.Add([pscustomobject]@{ Value = '2'; Label = '手动删除' })
     }
-    $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '退出' })
+    if ($IncludeSkipCurrentDirectory) {
+        $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '跳过当前目录' })
+    }
+    else {
+        $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '退出' })
+    }
+    if ($IncludeExitScript) {
+        $menuOptionList.Add([pscustomobject]@{ Value = '00'; Label = '退出脚本' })
+    }
 
     return $menuOptionList.ToArray()
 }
@@ -1137,7 +1152,7 @@ function Read-DeletionAction {
 # 无路径且未指定模式时，先让用户选择扫描模式，避免默认落入单目录模式造成误解。
 function Read-InteractiveScanMode {
     $modeChoice = Read-MenuChoice -Title '请选择扫描模式:' -MenuOptionList @(
-        [pscustomobject]@{ Value = '1'; Label = '单目录模式（一个或多个目录分别扫描）' }
+        [pscustomobject]@{ Value = '1'; Label = '单目录模式（多个目录先扫描后操作）' }
         [pscustomobject]@{ Value = '2'; Label = '多目录合并模式（多个目录视作一个大目录）' }
         [pscustomobject]@{ Value = '3'; Label = '参考目录模式（第一个目录为参考目录）' }
         [pscustomobject]@{ Value = '0'; Label = '退出' }
@@ -1228,6 +1243,7 @@ function New-MergedDirectoryDeletionPlan {
 function New-DisplayPathMapFromDeletionPlan {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$DeletionPlanList
     )
 
@@ -1267,7 +1283,7 @@ function Invoke-ManualDeletion {
             if ($failedFileCount -gt 0) {
                 Write-Host "本次删除失败文件: $failedFileCount" -ForegroundColor Red
             }
-            return
+            return 'Exit'
         }
 
         if ($manualSelection.Action -eq 'Skip') {
@@ -1307,9 +1323,87 @@ function Invoke-ManualDeletion {
     if ($failedFileCount -gt 0) {
         Write-Host "删除失败文件: $failedFileCount" -ForegroundColor Red
     }
+
+    return 'Continue'
 }
 
-# 单目录去重入口：先预览默认删除计划，再按用户选择执行默认或手动删除。
+# 统计默认删除计划中的待删除文件数，用于多目录扫描完成后的汇总输出。
+function Get-DeletionPlanItemCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DeletionPlanList
+    )
+
+    $deletionItemCount = 0
+    foreach ($deletionPlan in $DeletionPlanList) {
+        $deletionItemCount += @($deletionPlan.DeletionItems).Count
+    }
+
+    return $deletionItemCount
+}
+
+# 对已经生成的单目录删除计划执行预览、默认删除或手动删除。
+function Invoke-SingleDirectoryDeletionPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DeletionPlanList,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$AllowSkipCurrentDirectory
+    )
+
+    if ($DeletionPlanList.Count -eq 0) {
+        Write-Host "未发现重复文件。" -ForegroundColor Green
+        return 'Continue'
+    }
+
+    if ($AssumeYes) {
+        if (-not (Wait-AssumeYesDeletionGracePeriod)) {
+            return 'Exit'
+        }
+
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
+        return 'Continue'
+    }
+
+    [void](Write-DeletionPlanPreview -DeletionPlanList $DeletionPlanList -SummaryFormat '重复文件列举完成。默认计划删除重复文件: {0}')
+    if ($AllowSkipCurrentDirectory) {
+        $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion -IncludeSkipCurrentDirectory -IncludeExitScript
+    }
+    else {
+        $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion
+    }
+    $menuChoice = Read-DeletionAction -MenuOptionList $menuOptionList
+
+    if ($menuChoice -eq '0') {
+        if ($AllowSkipCurrentDirectory) {
+            Write-Host "已跳过当前目录，未删除任何文件。" -ForegroundColor Yellow
+            return 'Skip'
+        }
+
+        Write-Host "已退出脚本，未删除任何文件。" -ForegroundColor Yellow
+        return 'Exit'
+    }
+
+    if ($menuChoice -eq '00') {
+        Write-Host "已退出脚本，未删除任何文件。" -ForegroundColor Yellow
+        return 'Exit'
+    }
+
+    if ($menuChoice -eq '1') {
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
+        return 'Continue'
+    }
+
+    return (Invoke-ManualDeletion -DeletionPlanList $DeletionPlanList -RootPath $RootPath)
+}
+
+# 单目录去重入口：扫描一个目录后预览默认删除计划，再按用户选择执行删除。
 function Invoke-SingleDirectoryMode {
     param(
         [Parameter(Mandatory = $true)]
@@ -1317,51 +1411,55 @@ function Invoke-SingleDirectoryMode {
     )
 
     $deletionPlanList = @(New-SingleDirectoryDeletionPlan -RootPath $RootPath)
-    if ($deletionPlanList.Count -eq 0) {
-        Write-Host "未发现重复文件。" -ForegroundColor Green
-        return
-    }
-
-    if ($AssumeYes) {
-        if (-not (Wait-AssumeYesDeletionGracePeriod)) {
-            return
-        }
-
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
-        return
-    }
-
-    [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions -IncludeManualDeletion)
-
-    if ($menuChoice -eq '0') {
-        Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
-        return
-    }
-
-    if ($menuChoice -eq '1') {
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
-        return
-    }
-
-    Invoke-ManualDeletion -DeletionPlanList $deletionPlanList -RootPath $RootPath
+    [void](Invoke-SingleDirectoryDeletionPlan -RootPath $RootPath -DeletionPlanList $deletionPlanList)
 }
 
-# 多个目录分别执行单目录模式；每个目录独立预览、独立确认。
+# 多个单目录先全部扫描，再按目录逐个预览和确认，避免扫描过程中被菜单反复打断。
 function Invoke-IndependentSingleDirectoryMode {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$RootPathList
     )
 
+    if ($RootPathList.Count -eq 1) {
+        Invoke-SingleDirectoryMode -RootPath $RootPathList[0]
+        return
+    }
+
+    $singleDirectoryPlanRecordList = [System.Collections.Generic.List[object]]::new()
     for ($rootIndex = 0; $rootIndex -lt $RootPathList.Count; $rootIndex++) {
-        if ($RootPathList.Count -gt 1) {
-            Write-PreviewSeparator
-            Write-Host "单目录模式 $($rootIndex + 1) / $($RootPathList.Count): $($RootPathList[$rootIndex])" -ForegroundColor Cyan
+        Write-PreviewSeparator
+        Write-Host "单目录模式扫描 $($rootIndex + 1) / $($RootPathList.Count): $($RootPathList[$rootIndex])" -ForegroundColor Cyan
+
+        $deletionPlanList = @(New-SingleDirectoryDeletionPlan -RootPath $RootPathList[$rootIndex])
+        $plannedDeletionCount = Get-DeletionPlanItemCount -DeletionPlanList $deletionPlanList
+        if ($deletionPlanList.Count -eq 0) {
+            Write-Host "扫描结果: 未发现重复文件。" -ForegroundColor Green
+        }
+        else {
+            Write-Host "扫描结果: 重复组数 $($deletionPlanList.Count)，默认计划删除文件数 $plannedDeletionCount。" -ForegroundColor DarkGray
         }
 
-        Invoke-SingleDirectoryMode -RootPath $RootPathList[$rootIndex]
-        if ($AssumeYesDeletionCancelled) {
+        $singleDirectoryPlanRecordList.Add([pscustomobject]@{
+            RootPath         = $RootPathList[$rootIndex]
+            DeletionPlanList = $deletionPlanList
+        })
+    }
+
+    $actionPlanRecordList = @($singleDirectoryPlanRecordList | Where-Object { $_.DeletionPlanList.Count -gt 0 })
+    $actionDirectoryCount = $actionPlanRecordList.Count
+    Write-StatusSummary -Message "单目录模式扫描完成。待操作目录: $actionDirectoryCount / $($RootPathList.Count)" -Color Cyan
+    if ($actionDirectoryCount -eq 0) {
+        return
+    }
+
+    for ($recordIndex = 0; $recordIndex -lt $actionPlanRecordList.Count; $recordIndex++) {
+        $planRecord = $actionPlanRecordList[$recordIndex]
+        Write-PreviewSeparator
+        Write-Host "单目录模式操作 $($recordIndex + 1) / $($actionPlanRecordList.Count): $($planRecord.RootPath)" -ForegroundColor Cyan
+
+        $operationResult = Invoke-SingleDirectoryDeletionPlan -RootPath $planRecord.RootPath -DeletionPlanList @($planRecord.DeletionPlanList) -AllowSkipCurrentDirectory
+        if ($operationResult -eq 'Exit' -or $AssumeYesDeletionCancelled) {
             return
         }
     }
@@ -1403,7 +1501,7 @@ function Invoke-MergedDirectoryMode {
     }
 
     $displayPathByFullName = New-DisplayPathMapFromDeletionPlan -DeletionPlanList $deletionPlanList
-    Invoke-ManualDeletion -DeletionPlanList $deletionPlanList -DisplayPathByFullName $displayPathByFullName
+    [void](Invoke-ManualDeletion -DeletionPlanList $deletionPlanList -DisplayPathByFullName $displayPathByFullName)
 }
 
 # 为参考目录模式建立轻量参考索引；这里只按文件大小分组，不读取文件内容。

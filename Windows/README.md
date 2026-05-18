@@ -70,7 +70,7 @@ pwsh -File .\Convert-OfficeFiles.ps1 -MoveDelayMilliseconds 500 "C:\Path\Folder"
 
 ### 模式
 
-- 单目录模式：不传入 `-a` 或 `-c` 时启用；多个目录会分别扫描。
+- 单目录模式：不传入 `-a` 或 `-c` 时启用；多个目录会先全部扫描，再逐个目录操作。
 - 多目录合并模式：传入 `-a` 时启用；多个目录视作一个大目录。
 - 参考目录模式：传入 `-c` 时启用；第一个目录为参考目录，只删除后续目标目录中的重复文件。
 
@@ -93,7 +93,7 @@ pwsh -File .\Convert-OfficeFiles.ps1 -MoveDelayMilliseconds 500 "C:\Path\Folder"
 pwsh -File .\Remove-DuplicateFiles.ps1 "C:\Path\Folder"
 ```
 
-多个目录分别执行单目录模式：
+多个目录先全部扫描，再逐个目录操作：
 
 ```powershell
 pwsh -File .\Remove-DuplicateFiles.ps1 "C:\Path\A" "C:\Path\B"
@@ -127,11 +127,11 @@ pwsh -File .\Remove-DuplicateFiles.ps1 -c "C:\Path\Reference" "C:\Path\TargetA" 
 
 - 路径必须是 Windows 文件夹绝对路径；交互输入可分行，也可在同一行用空格或英文分号分隔，路径含空格请加引号。
 - 单目录模式会拒绝重复输入同一目录；多目录合并模式和参考目录模式会拒绝相同目录、父子目录和互相嵌套目录。
-- 除 `-yes` 外，删除前会先显示预览；单目录和多目录合并模式提供 `默认删除 / 手动删除 / 退出`，参考目录模式提供 `默认删除 / 退出`。
+- 除 `-yes` 外，删除前会先显示预览；单目录和多目录合并模式提供 `默认删除 / 手动删除 / 退出`，参考目录模式提供 `默认删除 / 退出`。多个单目录逐个操作时，`0` 表示跳过当前目录，`00` 表示退出脚本。
 - 默认保留文件名最短的文件；长度相同时按文件名和完整路径排序。
 - 删除使用 `Remove-Item`，不会进入回收站；扫描、哈希或删除失败时会提示并继续处理后续文件。
 - `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，使用 UTF-8 with BOM 保存；允许脚本执行可运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
 
 ### 哈希策略
 
-脚本先比较文件大小，再比较部分 SHA-256，最后只对候选文件计算完整 SHA-256。部分哈希默认读取文件头尾各2568KB。参考目录模式会先建立“文件大小 -> 参考文件列表”的轻量索引；部分哈希和完整哈希都按需懒加载并在本次运行内缓存，后续目标目录命中同一参考文件时不会重复计算。
+脚本先比较文件大小，再比较部分 SHA-256，最后只对候选文件计算完整 SHA-256。部分哈希默认读取文件头尾各256KB。参考目录模式会先建立“文件大小 -> 参考文件列表”的轻量索引；部分哈希和完整哈希都按需懒加载并在本次运行内缓存，后续目标目录命中同一参考文件时不会重复计算。

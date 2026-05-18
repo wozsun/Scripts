@@ -12,6 +12,8 @@
   -yes   跳过预览和菜单，等待 10 秒后执行默认删除计划。
 #>
 
+# ========== 参数区 ==========
+
 [CmdletBinding()]
 param(
     [Alias('h')]
@@ -33,16 +35,7 @@ param(
     [string[]]$PathList
 )
 
-Set-StrictMode -Version Latest
-
-# 遇到未处理异常时立即进入 catch/退出流程，避免继续执行危险操作。
-$ErrorActionPreference = 'Stop'
-
-# 是否扫描隐藏文件和隐藏文件夹；由 -s 参数控制。
-$ShouldIncludeHiddenItems = [bool]$IncludeHidden
-
-# 是否启用无交互默认删除；由 -yes 参数控制。
-$ShouldAssumeYesDeletion = [bool]$AssumeYes
+# ========== 可调整配置 ==========
 
 # 部分哈希预筛选时读取文件头尾每段的字节数；值越大越稳，扫描成本也越高。
 $PartialHashSegmentByteCount = 256KB
@@ -70,6 +63,23 @@ $AssumeYesGraceSeconds = 10
 
 # -yes 倒计时期间检查 Enter 输入的间隔。
 $AssumeYesInputPollIntervalMilliseconds = 100
+
+# ========== 运行环境设置 ==========
+
+Set-StrictMode -Version Latest
+
+# 遇到未处理异常时立即进入 catch/退出流程，避免继续执行危险操作。
+$ErrorActionPreference = 'Stop'
+
+# ========== 参数派生选项 ==========
+
+# 是否扫描隐藏文件和隐藏文件夹，由 -s 参数决定。
+$ShouldIncludeHiddenItems = [bool]$IncludeHidden
+
+# 是否启用无交互默认删除，由 -yes 参数决定。
+$ShouldAssumeYesDeletion = [bool]$AssumeYes
+
+# ========== 运行状态 ==========
 
 # 记录 -yes 倒计时是否被 Enter 取消；多目录分别执行时用于停止后续目录。
 $AssumeYesDeletionCancelled = $false
@@ -487,7 +497,8 @@ function Read-InteractivePathList {
     )
 
     $inputPathList = [System.Collections.Generic.List[string]]::new()
-    Write-Host "请逐行输入${ModeName}目录绝对路径；也可同一行输入多个路径。" -ForegroundColor Yellow
+    Write-Host "进入$ModeName。" -ForegroundColor Cyan
+    Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
     Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号；直接回车开始执行或退出。" -ForegroundColor DarkGray
 
     while ($true) {
@@ -739,7 +750,27 @@ function Get-DirectoryLabel {
     return [string]::IsNullOrWhiteSpace($name) ? $RootPath.TrimEnd('\') : $name
 }
 
-# 按默认保留规则排序文件：文件名更短者优先，其次按文件名和完整路径排序。
+# 获取文件所在目录的规范化路径，用于默认保留优先级判断。
+function Get-FileParentDirectoryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    return ConvertTo-NormalizedDirectoryPath -Path (Split-Path -Parent $File.FullName)
+}
+
+# 统计目录路径层级；层级越少，默认保留优先级越高。
+function Get-DirectoryPathDepth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return @($Path -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+}
+
+# 按默认保留规则排序文件：先比较所在目录，再用文件名作为同目录兜底。
 function Get-FilesByKeepPriority {
     param(
         [Parameter(Mandatory = $true)]
@@ -747,7 +778,9 @@ function Get-FilesByKeepPriority {
     )
 
     return $FileList |
-        Sort-Object @{ Expression = { $_.Name.Length }; Ascending = $true },
+        Sort-Object @{ Expression = { Get-DirectoryPathDepth -Path (Get-FileParentDirectoryPath -File $_) }; Ascending = $true },
+                    @{ Expression = { (Get-FileParentDirectoryPath -File $_).Length }; Ascending = $true },
+                    @{ Expression = { $_.Name.Length }; Ascending = $true },
                     @{ Expression = { $_.Name }; Ascending = $true },
                     @{ Expression = { $_.FullName }; Ascending = $true }
 }
@@ -1245,7 +1278,7 @@ function Read-InteractiveScanMode {
         [pscustomobject]@{ Value = '1'; Label = '单目录模式（多个目录先扫描后操作）' }
         [pscustomobject]@{ Value = '2'; Label = '多目录合并模式（多个目录视作一个大目录）' }
         [pscustomobject]@{ Value = '3'; Label = '参考目录模式（第一个目录为参考目录）' }
-        [pscustomobject]@{ Value = '0'; Label = '退出' }
+        [pscustomobject]@{ Value = '0'; Label = '退出脚本' }
     )
 
     switch ($modeChoice) {

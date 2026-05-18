@@ -6,14 +6,15 @@
 参数：
   -h     显示帮助信息。
   -s     包含隐藏文件和隐藏文件夹。
-  -MoveDelayMilliseconds  移动转换结果前的延时毫秒数，默认 200。
   Path   要扫描的文件夹绝对路径。
 
 关键规则：
   默认保留原始文件。
   新文件已存在时跳过，不覆盖。
-  只创建新格式文件，不删除、移动或覆盖原始文件。
+  旧格式原始文件不会被删除、移动或覆盖。
 #>
+
+# ========== 参数区 ==========
 
 [CmdletBinding()]
 param(
@@ -23,21 +24,17 @@ param(
     [Alias('s')]
     [switch]$IncludeHidden,
 
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 60000)]
-    [int]$MoveDelayMilliseconds = 200,
-
     [Parameter(Mandatory = $false, Position = 0)]
     [string]$Path
 )
 
-Set-StrictMode -Version Latest
+# ========== 可调整配置 ==========
 
-# 遇到未处理异常时立即进入 catch/退出流程，避免后续步骤继续处理不完整状态。
-$ErrorActionPreference = 'Stop'
+# 转换完成后统一移动文件前的单文件等待时间，给 OneDrive 等同步目录留出短暂缓冲。
+$FileMoveDelayMilliseconds = 200
 
 # 进度条宽度，统一使用 # 和 -，便于在 Windows/macOS 终端中保持可读。
-$ProgressBarCellCount = 28
+$ProgressBarCellCount = 32
 
 # 脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
 $TempRootDirectoryName = '.convert-officefiles-tmp'
@@ -65,6 +62,18 @@ $OfficeFormatMap = @{
     }
 }
 
+# ========== 运行环境设置 ==========
+
+Set-StrictMode -Version Latest
+
+# 遇到未处理异常时立即进入 catch/退出流程，避免后续步骤继续处理不完整状态。
+$ErrorActionPreference = 'Stop'
+
+# ========== 参数派生选项 ==========
+
+# 是否扫描隐藏文件和隐藏文件夹，由 -s 参数决定。
+$ShouldIncludeHiddenItems = [bool]$IncludeHidden
+
 # 输出脚本用途、参数和关键安全规则。
 function Show-HelpText {
     Write-Host @'
@@ -72,14 +81,12 @@ function Show-HelpText {
   使用本机 Office 原生应用，将指定文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
 
 用法：
-  pwsh -File .\Convert-OfficeFiles.ps1 [-s] [-MoveDelayMilliseconds 200] <Path>
+  pwsh -File .\Convert-OfficeFiles.ps1 [-s] <Path>
   pwsh -File .\Convert-OfficeFiles.ps1 -h
 
 参数：
   -s
     包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
-  -MoveDelayMilliseconds
-    Office 退出后，移动每个转换结果前等待的毫秒数。默认 200，传入 0 表示不等待。
 
 规则：
   默认保留原始 .doc、.xls、.ppt 文件。
@@ -278,7 +285,7 @@ function Get-LegacyOfficeFiles {
 
     Write-StageMessage "开始扫描目录: $RootPath"
     $scanErrors = $null
-    if ($IncludeHidden) {
+    if ($ShouldIncludeHiddenItems) {
         $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
     }
     else {
@@ -296,7 +303,7 @@ function Get-LegacyOfficeFiles {
         }
     )
 
-    $hiddenModeText = if ($IncludeHidden) { '包含隐藏项' } else { '不包含隐藏项' }
+    $hiddenModeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
     Write-StageMessage "扫描完成，文件数: $($files.Count)，旧格式 Office 文件: $($legacyFiles.Count)，$hiddenModeText"
     return $legacyFiles
 }
@@ -599,6 +606,7 @@ function Convert-OfficeFile {
                 }
             }
             catch {
+                Write-Debug "关闭 Office 文档失败: $($_.Exception.Message)"
             }
         }
 
@@ -627,6 +635,7 @@ function Close-OfficeApplications {
             $application.Quit()
         }
         catch {
+            Write-Debug "退出 Office 应用失败: $($_.Exception.Message)"
         }
         finally {
             Remove-ComObject -ComObject $application
@@ -660,7 +669,7 @@ function Move-ConvertedOfficeFiles {
         }
     }
 
-    Write-StageMessage "开始移动转换文件，待移动: $($TempConversionResults.Count)，单文件延时: ${MoveDelayMilliseconds}ms"
+    Write-StageMessage "开始移动转换文件，待移动: $($TempConversionResults.Count)，单文件延时: ${FileMoveDelayMilliseconds}ms"
 
     foreach ($conversionResult in $TempConversionResults) {
         $processedCount++
@@ -668,7 +677,7 @@ function Move-ConvertedOfficeFiles {
         $tempOutputPath = $conversionResult.TempOutputPath
 
         Write-ProgressBar -Activity '移动转换文件' -Status "正在移动 $($plan.TargetPathText)" -ProcessedCount $processedCount -TotalCount $TempConversionResults.Count -LastPercent ([ref]$lastPercent)
-        Start-Sleep -Milliseconds $MoveDelayMilliseconds
+        Start-Sleep -Milliseconds $FileMoveDelayMilliseconds
 
         if (Test-Path -LiteralPath $plan.TargetPath) {
             if (Remove-TempOutputFile -TempOutputPath $tempOutputPath) {

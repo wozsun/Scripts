@@ -14,7 +14,6 @@
 | --- | --- | --- | --- |
 | `Path` | 是 | 无 | 要扫描的文件夹绝对路径。 |
 | `-s` | 否 | 关闭 | 包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。 |
-| `-MoveDelayMilliseconds` | 否 | `200` | Office 退出后，移动每个转换结果前等待的毫秒数；传入 `0` 表示不等待。 |
 | `-h` | 否 | 关闭 | 显示帮助信息。 |
 
 ### 使用示例
@@ -37,12 +36,6 @@ pwsh -File .\Convert-OfficeFiles.ps1 "C:\Path\Folder"
 pwsh -File .\Convert-OfficeFiles.ps1 -s "C:\Path\Folder"
 ```
 
-调整统一移动阶段的单文件延时：
-
-```powershell
-pwsh -File .\Convert-OfficeFiles.ps1 -MoveDelayMilliseconds 500 "C:\Path\Folder"
-```
-
 ### 注意事项
 
 - 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Documents`；交互输入时可以粘贴带首尾引号的路径。
@@ -54,7 +47,7 @@ pwsh -File .\Convert-OfficeFiles.ps1 -MoveDelayMilliseconds 500 "C:\Path\Folder"
 - 有密码、损坏、受保护视图、外部链接或需要人工确认的文件可能转换失败。
 - 每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 - 转换时会在目标目录下创建 `.convert-officefiles-tmp\<本次运行ID>` 专属临时子文件夹保存临时文件；全部文件转换完成并退出 Office 后，再统一移动到目标位置。
-- 统一移动阶段会显示百分比进度条，每个文件移动前默认等待 `200ms`，可通过 `-MoveDelayMilliseconds` 调整。
+- 统一移动阶段会显示百分比进度条，每个文件移动前默认等待 `200ms`；如需调整，可修改脚本顶部的 `$FileMoveDelayMilliseconds` 配置项。
 - 移动完成后脚本会自动清理本次运行创建的临时文件和空的专属临时文件夹。
 - 转换过程会启动 Office 应用实例，转换完成后脚本会自动退出这些实例。
 
@@ -128,7 +121,7 @@ pwsh -File .\Remove-DuplicateFiles.ps1 -c "C:\Path\Reference" "C:\Path\TargetA" 
 - 路径必须是 Windows 文件夹绝对路径；交互输入可分行，也可在同一行用空格或英文分号分隔，路径含空格请加引号。
 - 单目录模式会拒绝重复输入同一目录；多目录合并模式和参考目录模式会拒绝相同目录、父子目录和互相嵌套目录。
 - 除 `-yes` 外，删除前会先显示预览；单目录和多目录合并模式提供 `默认删除 / 手动删除 / 退出`，参考目录模式提供 `默认删除 / 退出`。多个单目录逐个操作时，`0` 表示跳过当前目录，`00` 表示退出脚本。
-- 默认保留文件名最短的文件；长度相同时按文件名和完整路径排序。
+- 默认保留规则：同一目录内优先保留文件名更短的文件；不同目录之间优先保留父目录中的文件；不属于父子目录时，优先保留目录层级更少的文件；目录层级相同时，优先保留目录路径更短的文件；仍相同时按文件名和完整路径排序。
 - 删除使用 `Remove-Item`，不会进入回收站；扫描、哈希或删除失败时会提示并继续处理后续文件。
 - `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，使用 UTF-8 with BOM 保存；允许脚本执行可运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
 

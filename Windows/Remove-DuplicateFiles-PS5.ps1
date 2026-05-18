@@ -1303,9 +1303,9 @@ function Read-DeletionAction {
 # 无路径且未指定模式时，先让用户选择扫描模式，避免默认落入单目录模式造成误解。
 function Read-InteractiveScanMode {
     $modeChoice = Read-MenuChoice -Title '请选择扫描模式:' -MenuOptionList @(
-        [pscustomobject]@{ Value = '1'; Label = '单目录模式（多个目录先扫描后操作）' }
+        [pscustomobject]@{ Value = '1'; Label = '单目录模式（每个目录分别扫描）' }
         [pscustomobject]@{ Value = '2'; Label = '多目录合并模式（多个目录视作一个大目录）' }
-        [pscustomobject]@{ Value = '3'; Label = '参考目录模式（第一个目录为参考目录）' }
+        [pscustomobject]@{ Value = '3'; Label = '参考目录模式（首个目录作为参考目录）' }
         [pscustomobject]@{ Value = '0'; Label = '退出脚本' }
     )
 

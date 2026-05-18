@@ -111,11 +111,36 @@ function Show-HelpText {
 
 说明：
   无路径且未指定 -a/-c 时，会先显示模式菜单。
+  路径输入阶段可输入 0 返回模式菜单，输入 00 退出脚本。
   单目录和多目录合并模式可默认删除、手动删除或退出。
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除或退出。
   交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请加引号。
 '@
+}
+
+# 输出已启用的关键参数，避免进入交互菜单后忘记当前运行选项。
+function Write-EnabledOptionNotice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$IncludeHiddenItems,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$AssumeYesDeletion
+    )
+
+    if (-not $IncludeHiddenItems -and -not $AssumeYesDeletion) {
+        return
+    }
+
+    Write-Host ""
+    if ($IncludeHiddenItems) {
+        Write-Host "已启用 -s：扫描将包含隐藏文件和隐藏文件夹。" -ForegroundColor Cyan
+    }
+
+    if ($AssumeYesDeletion) {
+        Write-Host "已启用 -yes：扫描完成后将会跳过预览和删除选择菜单。" -ForegroundColor Red
+    }
 }
 
 # 输出当前执行阶段，避免大目录扫描时长时间无反馈。
@@ -480,37 +505,81 @@ function Resolve-InputDirectoryList {
         [string[]]$PathList,
 
         [Parameter(Mandatory = $false)]
-        [string]$ParameterNamePrefix = 'Path'
+        [string]$ParameterNamePrefix = 'Path',
+
+        [Parameter(Mandatory = $false)]
+        [int]$StartIndex = 1
     )
 
     return @(
         for ($index = 0; $index -lt $PathList.Count; $index++) {
-            Resolve-InputDirectory -Path $PathList[$index] -ParameterName "$($ParameterNamePrefix)[$($index + 1)]"
+            Resolve-InputDirectory -Path $PathList[$index] -ParameterName "$($ParameterNamePrefix)[$($StartIndex + $index)]"
         }
     )
 }
 
-# 无参数执行时按行读取一个或多个目录路径；已输入至少一个路径后，空回车开始执行。
+# 拆分并校验交互输入的一行路径，返回本行识别数量和规范化后的目录列表。
+function Resolve-InteractivePathInputLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathInput,
+
+        [Parameter(Mandatory = $true)]
+        [int]$StartIndex
+    )
+
+    $pathInputList = @(Split-InteractivePathInput -PathInput $PathInput)
+    if ($pathInputList.Count -eq 0) {
+        throw '未识别到可用路径。'
+    }
+
+    $resolvedPathInputList = @(Resolve-InputDirectoryList -PathList $pathInputList -ParameterNamePrefix 'Path' -StartIndex $StartIndex)
+
+    return [pscustomobject]@{
+        InputCount = $pathInputList.Count
+        PathList   = $resolvedPathInputList
+    }
+}
+
+# 交互读取一个或多个目录路径；0 返回模式菜单，00 直接退出脚本。
 function Read-InteractivePathList {
     param(
         [Parameter(Mandatory = $true)]
         [string]$ModeName,
 
         [Parameter(Mandatory = $true)]
-        [int]$MinimumCount
+        [int]$MinimumCount,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$RequireIndependentDirectorySet = $false
     )
 
     $inputPathList = New-Object System.Collections.Generic.List[string]
     Write-Host "进入$ModeName。" -ForegroundColor Cyan
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号；直接回车开始执行或退出。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号。" -ForegroundColor DarkGray
+    Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {
         $pathInput = (Read-Host "Path$($inputPathList.Count + 1)").Trim()
+        if ($pathInput -eq '00') {
+            return [pscustomobject]@{
+                Action   = 'Exit'
+                PathList = @()
+            }
+        }
+
+        if ($pathInput -eq '0') {
+            return [pscustomobject]@{
+                Action   = 'Back'
+                PathList = @()
+            }
+        }
+
         if ([string]::IsNullOrWhiteSpace($pathInput)) {
             if ($inputPathList.Count -eq 0) {
-                Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
-                exit 0
+                Write-Host "尚未输入目录；请输入目录，或输入 0 返回上级菜单，输入 00 退出脚本。" -ForegroundColor Yellow
+                continue
             }
 
             if ($inputPathList.Count -lt $MinimumCount) {
@@ -518,16 +587,42 @@ function Read-InteractivePathList {
                 continue
             }
 
-            return $inputPathList.ToArray()
+            return [pscustomobject]@{
+                Action   = 'Submit'
+                PathList = $inputPathList.ToArray()
+            }
         }
 
-        $pathInputList = @(Split-InteractivePathInput -PathInput $pathInput)
-        foreach ($inputPath in $pathInputList) {
-            $inputPathList.Add($inputPath)
+        try {
+            $lineInputResult = Resolve-InteractivePathInputLine -PathInput $pathInput -StartIndex ($inputPathList.Count + 1)
+        }
+        catch {
+            Write-Host "输入无效，请重新输入存在的 Windows 文件夹绝对路径；路径含空格请加引号。" -ForegroundColor Yellow
+            continue
         }
 
-        if ($pathInputList.Count -gt 1) {
-            Write-Host "已识别 $($pathInputList.Count) 个路径。" -ForegroundColor DarkGray
+        $resolvedPathInputList = @($lineInputResult.PathList)
+        $candidatePathList = @($inputPathList.ToArray()) + $resolvedPathInputList
+
+        try {
+            Test-DirectorySetForMode -RootPathList $candidatePathList -RequireIndependentDirectorySet $RequireIndependentDirectorySet
+        }
+        catch {
+            if ($RequireIndependentDirectorySet) {
+                Write-Host "输入无效，该模式不允许相同目录、父子目录或互相包含的目录，请重新输入。" -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "路径无效，请不要重复输入同一个目录。本次输入不保留。" -ForegroundColor Yellow
+            }
+            continue
+        }
+
+        foreach ($resolvedInputPath in $resolvedPathInputList) {
+            $inputPathList.Add($resolvedInputPath)
+        }
+
+        if ($lineInputResult.InputCount -gt 1) {
+            Write-Host "识别到 $($lineInputResult.InputCount) 个路径。" -ForegroundColor DarkGray
         }
     }
 }
@@ -644,6 +739,24 @@ function Test-IndependentDirectorySet {
                 -RightName "Path$($rightIndex + 1)"
         }
     }
+}
+
+# 按当前扫描模式校验目录集合；单目录模式只禁止重复目录，合并/参考模式禁止互相包含。
+function Test-DirectorySetForMode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$RootPathList,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$RequireIndependentDirectorySet
+    )
+
+    if ($RequireIndependentDirectorySet) {
+        Test-IndependentDirectorySet -RootPathList $RootPathList
+        return
+    }
+
+    Test-UniqueDirectorySet -RootPathList $RootPathList
 }
 
 # ========== 哈希与重复文件识别 ==========
@@ -1315,6 +1428,41 @@ function Read-InteractiveScanMode {
         '3' { return 'Reference' }
         '0' { return 'Exit' }
     }
+}
+
+# 根据当前模式返回交互输入所需的最少目录数量。
+function Get-ScanModeMinimumPathCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$UseReferenceMode
+    )
+
+    if ($UseReferenceMode) {
+        return 2
+    }
+
+    return 1
+}
+
+# 根据当前模式返回用户可读的模式名称。
+function Get-ScanModeName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$UseReferenceMode,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$UseAggregateMode
+    )
+
+    if ($UseReferenceMode) {
+        return '参考目录模式'
+    }
+
+    if ($UseAggregateMode) {
+        return '多目录合并模式'
+    }
+
+    return '单目录模式'
 }
 
 # 为单目录模式生成默认删除计划。
@@ -1993,36 +2141,64 @@ $useAggregateMode = [bool]$AggregateMode
 $useReferenceMode = [bool]$ReferenceMode
 $inputPathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
-if ($inputPathList.Count -eq 0 -and -not $useAggregateMode -and -not $useReferenceMode) {
-    $selectedScanMode = Read-InteractiveScanMode
-    switch ($selectedScanMode) {
-        'Aggregate' {
-            $useAggregateMode = $true
+Write-EnabledOptionNotice -IncludeHiddenItems $ShouldIncludeHiddenItems -AssumeYesDeletion $ShouldAssumeYesDeletion
+
+if ($inputPathList.Count -eq 0) {
+    $shouldReadScanMode = -not $useAggregateMode -and -not $useReferenceMode
+    $hasInteractivePathList = $false
+
+    while (-not $hasInteractivePathList) {
+        if ($shouldReadScanMode) {
+            $selectedScanMode = Read-InteractiveScanMode
+            switch ($selectedScanMode) {
+                'Single' {
+                    $useAggregateMode = $false
+                    $useReferenceMode = $false
+                }
+                'Aggregate' {
+                    $useAggregateMode = $true
+                    $useReferenceMode = $false
+                }
+                'Reference' {
+                    $useAggregateMode = $false
+                    $useReferenceMode = $true
+                }
+                'Exit' {
+                    Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+                    exit 0
+                }
+            }
         }
-        'Reference' {
-            $useReferenceMode = $true
-        }
-        'Exit' {
-            Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
-            exit 0
+
+        $minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $useReferenceMode
+        $modeName = Get-ScanModeName -UseReferenceMode $useReferenceMode -UseAggregateMode $useAggregateMode
+        $pathInputResult = Read-InteractivePathList -ModeName $modeName -MinimumCount $minimumPathCount -RequireIndependentDirectorySet:($useReferenceMode -or $useAggregateMode)
+
+        switch ($pathInputResult.Action) {
+            'Submit' {
+                $inputPathList = @($pathInputResult.PathList)
+                $hasInteractivePathList = $true
+            }
+            'Back' {
+                Write-Host "已返回上级菜单。" -ForegroundColor Yellow
+                $useAggregateMode = $false
+                $useReferenceMode = $false
+                $shouldReadScanMode = $true
+            }
+            'Exit' {
+                Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+                exit 0
+            }
+            default {
+                Write-Host "路径输入返回了未知状态: $($pathInputResult.Action)" -ForegroundColor Red
+                exit 1
+            }
         }
     }
 }
 
-$minimumPathCount = if ($useReferenceMode) { 2 } else { 1 }
-$modeName = if ($useReferenceMode) {
-    '参考目录模式'
-}
-elseif ($useAggregateMode) {
-    '多目录合并模式'
-}
-else {
-    '单目录模式'
-}
-
-if ($inputPathList.Count -eq 0) {
-    $inputPathList = @(Read-InteractivePathList -ModeName $modeName -MinimumCount $minimumPathCount)
-}
+$minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $useReferenceMode
+$modeName = Get-ScanModeName -UseReferenceMode $useReferenceMode -UseAggregateMode $useAggregateMode
 
 if ($inputPathList.Count -lt $minimumPathCount) {
     Write-Host "$modeName 至少需要输入 $minimumPathCount 个目录。" -ForegroundColor Red
@@ -2037,23 +2213,12 @@ catch {
     exit 1
 }
 
-if ($useReferenceMode -or $useAggregateMode) {
-    try {
-        Test-IndependentDirectorySet -RootPathList $resolvedPathList
-    }
-    catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        exit 1
-    }
+try {
+    Test-DirectorySetForMode -RootPathList $resolvedPathList -RequireIndependentDirectorySet:($useReferenceMode -or $useAggregateMode)
 }
-else {
-    try {
-        Test-UniqueDirectorySet -RootPathList $resolvedPathList
-    }
-    catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        exit 1
-    }
+catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
 }
 
 if ($useReferenceMode) {

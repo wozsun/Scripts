@@ -38,6 +38,12 @@ Set-StrictMode -Version Latest
 # 遇到未处理异常时立即进入 catch/退出流程，避免继续执行危险操作。
 $ErrorActionPreference = 'Stop'
 
+# 是否扫描隐藏文件和隐藏文件夹；由 -s 参数控制。
+$ShouldIncludeHiddenItems = [bool]$IncludeHidden
+
+# 是否启用无交互默认删除；由 -yes 参数控制。
+$ShouldAssumeYesDeletion = [bool]$AssumeYes
+
 # 部分哈希预筛选时读取文件头尾每段的字节数；值越大越稳，扫描成本也越高。
 $PartialHashSegmentByteCount = 256KB
 
@@ -48,7 +54,7 @@ $PreviewSeparatorCellCount = 64
 $PreviewSeparatorCharacter = '='
 
 # 文本进度条宽度。
-$ProgressBarCellCount = 28
+$ProgressBarCellCount = 32
 
 # 文本进度条已完成部分的字符。
 $ProgressBarFilledCharacter = '#'
@@ -56,7 +62,7 @@ $ProgressBarFilledCharacter = '#'
 # 文本进度条未完成部分的字符。
 $ProgressBarEmptyCharacter = '-'
 
-# 单行动态输出后附加的清理空格数量，用于覆盖上一轮较长输出的尾巴。
+# 倒计时状态结束后附加的清理空格数量，用于覆盖上一轮较长输出的尾巴。
 $ConsoleLineClearPadding = 20
 
 # 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
@@ -108,6 +114,90 @@ function Write-StageMessage {
     Write-Host "[进度] $Message" -ForegroundColor Cyan
 }
 
+# 估算字符在控制台中占用的单元格宽度；中文和全角字符通常占两格。
+function Get-ConsoleCharacterCellWidth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [char]$Character
+    )
+
+    $codePoint = [int]$Character
+    if (
+        ($codePoint -ge 0x1100 -and $codePoint -le 0x115F) -or
+        ($codePoint -ge 0x2E80 -and $codePoint -le 0xA4CF) -or
+        ($codePoint -ge 0xAC00 -and $codePoint -le 0xD7A3) -or
+        ($codePoint -ge 0xF900 -and $codePoint -le 0xFAFF) -or
+        ($codePoint -ge 0xFE10 -and $codePoint -le 0xFE6F) -or
+        ($codePoint -ge 0xFF00 -and $codePoint -le 0xFF60) -or
+        ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)
+    ) {
+        return 2
+    }
+
+    return 1
+}
+
+# 将文本限制在指定控制台宽度内，避免动态进度行因过长而换行。
+function Get-ConsoleTextWithinCellWidth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MaxCellWidth
+    )
+
+    $textBuilder = [System.Text.StringBuilder]::new()
+    $cellWidth = 0
+    foreach ($character in $Text.ToCharArray()) {
+        $characterWidth = Get-ConsoleCharacterCellWidth -Character $character
+        if (($cellWidth + $characterWidth) -gt $MaxCellWidth) {
+            break
+        }
+
+        [void]$textBuilder.Append($character)
+        $cellWidth += $characterWidth
+    }
+
+    return [pscustomobject]@{
+        Text      = $textBuilder.ToString()
+        CellWidth = $cellWidth
+    }
+}
+
+# 刷新单行动态状态：清理旧尾巴后把光标放回文本末尾，避免补空格导致光标漂移。
+function Write-DynamicStatusLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [System.ConsoleColor]$Color
+    )
+
+    try {
+        if (-not [Console]::IsOutputRedirected) {
+            $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
+            $lineText = Get-ConsoleTextWithinCellWidth -Text $Message -MaxCellWidth $maxLineWidth
+
+            $cursorTop = [Console]::CursorTop
+            Write-Host -NoNewline "`r$($lineText.Text)" -ForegroundColor $Color
+            $remainingWidth = [Math]::Max(0, $maxLineWidth - $lineText.CellWidth)
+            if ($remainingWidth -gt 0) {
+                Write-Host -NoNewline (' ' * $remainingWidth)
+                [Console]::SetCursorPosition($lineText.CellWidth, $cursorTop)
+            }
+            return
+        }
+    }
+    catch {
+        # 部分宿主不支持读取控制台宽度，回退为普通回车刷新。
+        Write-Debug "动态状态行刷新已回退: $($_.Exception.Message)"
+    }
+
+    Write-Host -NoNewline "`r$Message" -ForegroundColor $Color
+}
+
 # 更新百分比进度条；使用普通文本单行刷新，避免 Write-Progress 改变控制台背景色。
 function Write-ProgressBar {
     param(
@@ -141,7 +231,7 @@ function Write-ProgressBar {
     $bar = ($ProgressBarFilledCharacter * $filledWidth) + ($ProgressBarEmptyCharacter * $emptyWidth)
     $progressText = "[进度] $Activity [$bar] $percent% $Status ($ProcessedCount / $TotalCount)"
 
-    Write-Host -NoNewline "`r$progressText$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Cyan
+    Write-DynamicStatusLine -Message $progressText -Color Cyan
     $LastPercent.Value = $percent
 }
 
@@ -594,7 +684,7 @@ function Get-ScannedFiles {
 
     Write-StageMessage "开始扫描$($ProgressLabel): $RootPath"
     $scanErrorList = $null
-    if ($IncludeHidden) {
+    if ($ShouldIncludeHiddenItems) {
         $scannedFiles = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrorList)
     }
     else {
@@ -606,7 +696,7 @@ function Get-ScannedFiles {
         Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
     }
 
-    $hiddenScopeText = if ($IncludeHidden) { '包含隐藏项' } else { '不包含隐藏项' }
+    $hiddenScopeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
     Write-StageMessage "$($ProgressLabel)扫描完成，文件数: $($scannedFiles.Count)，$hiddenScopeText"
     return $scannedFiles
 }
@@ -1343,41 +1433,51 @@ function Get-DeletionPlanItemCount {
     return $deletionItemCount
 }
 
-# 对已经生成的单目录删除计划执行预览、默认删除或手动删除。
-function Invoke-SingleDirectoryDeletionPlan {
+# 对已经生成的删除计划执行预览、默认删除、手动删除、跳过或退出。
+function Invoke-DeletionPlanAction {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$RootPath,
-
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
         [object[]]$DeletionPlanList,
 
+        [Parameter(Mandatory = $true)]
+        [string]$EmptyMessage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PreviewSummaryFormat,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DefaultDeletionSummaryFormat,
+
         [Parameter(Mandatory = $false)]
-        [switch]$AllowSkipCurrentDirectory
+        [switch]$IncludeManualDeletion,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$AllowSkipCurrentDirectory,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ManualRootPath,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$ManualDisplayPathByFullName
     )
 
     if ($DeletionPlanList.Count -eq 0) {
-        Write-Host "未发现重复文件。" -ForegroundColor Green
+        Write-Host $EmptyMessage -ForegroundColor Green
         return 'Continue'
     }
 
-    if ($AssumeYes) {
+    if ($ShouldAssumeYesDeletion) {
         if (-not (Wait-AssumeYesDeletionGracePeriod)) {
             return 'Exit'
         }
 
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat $DefaultDeletionSummaryFormat)
         return 'Continue'
     }
 
-    [void](Write-DeletionPlanPreview -DeletionPlanList $DeletionPlanList -SummaryFormat '重复文件列举完成。默认计划删除重复文件: {0}')
-    if ($AllowSkipCurrentDirectory) {
-        $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion -IncludeSkipCurrentDirectory -IncludeExitScript
-    }
-    else {
-        $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion
-    }
+    [void](Write-DeletionPlanPreview -DeletionPlanList $DeletionPlanList -SummaryFormat $PreviewSummaryFormat)
+    $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion:$IncludeManualDeletion -IncludeSkipCurrentDirectory:$AllowSkipCurrentDirectory -IncludeExitScript:$AllowSkipCurrentDirectory
     $menuChoice = Read-DeletionAction -MenuOptionList $menuOptionList
 
     if ($menuChoice -eq '0') {
@@ -1396,11 +1496,42 @@ function Invoke-SingleDirectoryDeletionPlan {
     }
 
     if ($menuChoice -eq '1') {
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat '删除完成。已删除重复文件: {0}')
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat $DefaultDeletionSummaryFormat)
         return 'Continue'
     }
 
-    return (Invoke-ManualDeletion -DeletionPlanList $DeletionPlanList -RootPath $RootPath)
+    if ($IncludeManualDeletion) {
+        return (Invoke-ManualDeletion -DeletionPlanList $DeletionPlanList -RootPath $ManualRootPath -DisplayPathByFullName $ManualDisplayPathByFullName)
+    }
+
+    return 'Continue'
+}
+
+# 对单目录删除计划执行操作；多个单目录逐个操作时可允许跳过当前目录。
+function Invoke-SingleDirectoryDeletionAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DeletionPlanList,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$AllowSkipCurrentDirectory
+    )
+
+    $actionParameters = @{
+        DeletionPlanList             = $DeletionPlanList
+        EmptyMessage                 = '未发现重复文件。'
+        PreviewSummaryFormat         = '重复文件列举完成。默认计划删除重复文件: {0}'
+        DefaultDeletionSummaryFormat = '删除完成。已删除重复文件: {0}'
+        IncludeManualDeletion        = $true
+        AllowSkipCurrentDirectory    = $AllowSkipCurrentDirectory
+        ManualRootPath               = $RootPath
+    }
+
+    return (Invoke-DeletionPlanAction @actionParameters)
 }
 
 # 单目录去重入口：扫描一个目录后预览默认删除计划，再按用户选择执行删除。
@@ -1411,7 +1542,7 @@ function Invoke-SingleDirectoryMode {
     )
 
     $deletionPlanList = @(New-SingleDirectoryDeletionPlan -RootPath $RootPath)
-    [void](Invoke-SingleDirectoryDeletionPlan -RootPath $RootPath -DeletionPlanList $deletionPlanList)
+    [void](Invoke-SingleDirectoryDeletionAction -RootPath $RootPath -DeletionPlanList $deletionPlanList)
 }
 
 # 多个单目录先全部扫描，再按目录逐个预览和确认，避免扫描过程中被菜单反复打断。
@@ -1458,7 +1589,7 @@ function Invoke-IndependentSingleDirectoryMode {
         Write-PreviewSeparator
         Write-Host "单目录模式操作 $($recordIndex + 1) / $($actionPlanRecordList.Count): $($planRecord.RootPath)" -ForegroundColor Cyan
 
-        $operationResult = Invoke-SingleDirectoryDeletionPlan -RootPath $planRecord.RootPath -DeletionPlanList @($planRecord.DeletionPlanList) -AllowSkipCurrentDirectory
+        $operationResult = Invoke-SingleDirectoryDeletionAction -RootPath $planRecord.RootPath -DeletionPlanList @($planRecord.DeletionPlanList) -AllowSkipCurrentDirectory
         if ($operationResult -eq 'Exit' -or $AssumeYesDeletionCancelled) {
             return
         }
@@ -1473,35 +1604,16 @@ function Invoke-MergedDirectoryMode {
     )
 
     $deletionPlanList = @(New-MergedDirectoryDeletionPlan -RootPathList $RootPathList)
-    if ($deletionPlanList.Count -eq 0) {
-        Write-Host "未发现重复文件。" -ForegroundColor Green
-        return
-    }
-
-    if ($AssumeYes) {
-        if (-not (Wait-AssumeYesDeletionGracePeriod)) {
-            return
-        }
-
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从多目录合并结果中删除重复文件: {0}')
-        return
-    }
-
-    [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划从多目录合并结果中删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions -IncludeManualDeletion)
-
-    if ($menuChoice -eq '0') {
-        Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
-        return
-    }
-
-    if ($menuChoice -eq '1') {
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从多目录合并结果中删除重复文件: {0}')
-        return
-    }
-
     $displayPathByFullName = New-DisplayPathMapFromDeletionPlan -DeletionPlanList $deletionPlanList
-    [void](Invoke-ManualDeletion -DeletionPlanList $deletionPlanList -DisplayPathByFullName $displayPathByFullName)
+    $actionParameters = @{
+        DeletionPlanList            = $deletionPlanList
+        EmptyMessage                = '未发现重复文件。'
+        PreviewSummaryFormat        = '重复文件列举完成。默认计划从多目录合并结果中删除重复文件: {0}'
+        DefaultDeletionSummaryFormat = '删除完成。已从多目录合并结果中删除重复文件: {0}'
+        IncludeManualDeletion       = $true
+        ManualDisplayPathByFullName = $displayPathByFullName
+    }
+    [void](Invoke-DeletionPlanAction @actionParameters)
 }
 
 # 为参考目录模式建立轻量参考索引；这里只按文件大小分组，不读取文件内容。
@@ -1790,29 +1902,13 @@ function Invoke-ReferenceDirectoryMode {
         }
     )
 
-    if ($deletionPlanList.Count -eq 0) {
-        Write-Host "未发现目标目录中存在与参考目录重复的文件。" -ForegroundColor Green
-        return
+    $actionParameters = @{
+        DeletionPlanList             = $deletionPlanList
+        EmptyMessage                 = '未发现目标目录中存在与参考目录重复的文件。'
+        PreviewSummaryFormat         = '重复文件列举完成。默认计划从目标目录删除重复文件: {0}'
+        DefaultDeletionSummaryFormat = '删除完成。已从目标目录删除重复文件: {0}'
     }
-
-    if ($AssumeYes) {
-        if (-not (Wait-AssumeYesDeletionGracePeriod)) {
-            return
-        }
-
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从目标目录删除重复文件: {0}')
-        return
-    }
-
-    [void](Write-DeletionPlanPreview -DeletionPlanList $deletionPlanList -SummaryFormat '重复文件列举完成。默认计划从目标目录删除重复文件: {0}')
-    $menuChoice = Read-DeletionAction -MenuOptionList (New-DeletionActionMenuOptions)
-
-    if ($menuChoice -eq '0') {
-        Write-Host "已退出，未删除任何文件。" -ForegroundColor Yellow
-        return
-    }
-
-    [void](Invoke-DefaultDeletionPlan -DeletionPlanList $deletionPlanList -SummaryFormat '删除完成。已从目标目录删除重复文件: {0}')
+    [void](Invoke-DeletionPlanAction @actionParameters)
 }
 
 if ($Help) {

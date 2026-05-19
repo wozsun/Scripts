@@ -9,7 +9,7 @@
   -a     多目录合并模式，把多个目录抽象为一个大目录进行重复文件扫描。
   -c     参考目录模式，第一个目录为参考目录，其余目录为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
-  -yes   跳过预览和菜单，等待 10 秒后执行默认删除计划。
+  -yes   跳过详细预览和菜单，输出汇总后等待 10 秒，再执行默认删除计划。
 
 提示：
   如遇脚本无法执行的问题，先在管理员PowerShell中运行以下命令允许本地执行脚本：
@@ -106,15 +106,17 @@ function Show-HelpText {
   -a     多目录合并模式，把多个目录视作一个大目录。
   -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
-  -yes   跳过预览和菜单，等待 10 秒后默认删除；可按 Enter 取消。
+  -yes   跳过详细预览和菜单，输出汇总后等待 10 秒再默认删除；可按 Enter 取消。
   -h     显示帮助信息。
 
 说明：
   无路径且未指定 -a/-c 时，会先显示模式菜单。
+  交互模式每轮流程完成后会返回模式菜单；命令行带路径运行时执行一次后退出。
+  所有交互位置中，00 表示退出脚本，0 只表示返回或跳过。
   路径输入阶段可输入 0 返回模式菜单，输入 00 退出脚本。
-  单目录和多目录合并模式可默认删除、手动删除或退出。
+  单目录和多目录合并模式可默认删除、手动删除、跳过本次操作或退出。
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
-  参考目录模式只删除目标目录文件，可默认删除或退出。
+  参考目录模式只删除目标目录文件，可默认删除、跳过本次操作或退出。
   交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请加引号。
 '@
 }
@@ -139,7 +141,7 @@ function Write-EnabledOptionNotice {
     }
 
     if ($AssumeYesDeletion) {
-        Write-Host "已启用 -yes：扫描完成后将会跳过预览和删除选择菜单。" -ForegroundColor Red
+        Write-Host "已启用 -yes：扫描完成后将输出汇总，并跳过详细预览和删除选择菜单。" -ForegroundColor Red
     }
 }
 
@@ -324,7 +326,7 @@ function Wait-AssumeYesDeletionGracePeriod {
     )
 
     Write-Host ""
-    Write-Host "危险操作: 已启用 -yes，将跳过预览和菜单并执行默认删除。" -ForegroundColor Red
+    Write-Host "危险操作: 已启用 -yes，将跳过详细预览和菜单并执行默认删除。" -ForegroundColor Red
     Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
 
     for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
@@ -545,17 +547,14 @@ function Resolve-InteractivePathInputLine {
 function Read-InteractivePathList {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ModeName,
+        [string]$ModePrompt,
 
         [Parameter(Mandatory = $true)]
-        [int]$MinimumCount,
-
-        [Parameter(Mandatory = $false)]
-        [bool]$RequireIndependentDirectorySet = $false
+        [int]$MinimumCount
     )
 
     $inputPathList = New-Object System.Collections.Generic.List[string]
-    Write-Host "进入$ModeName。" -ForegroundColor Cyan
+    Write-Host "进入$ModePrompt。" -ForegroundColor Cyan
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
     Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
@@ -583,7 +582,7 @@ function Read-InteractivePathList {
             }
 
             if ($inputPathList.Count -lt $MinimumCount) {
-                Write-Host "$ModeName 至少需要输入 $MinimumCount 个目录。" -ForegroundColor Red
+                Write-Host "当前模式至少需要输入 $MinimumCount 个目录。" -ForegroundColor Red
                 continue
             }
 
@@ -605,15 +604,10 @@ function Read-InteractivePathList {
         $candidatePathList = @($inputPathList.ToArray()) + $resolvedPathInputList
 
         try {
-            Test-DirectorySetForMode -RootPathList $candidatePathList -RequireIndependentDirectorySet $RequireIndependentDirectorySet
+            Test-IndependentDirectorySet -RootPathList $candidatePathList
         }
         catch {
-            if ($RequireIndependentDirectorySet) {
-                Write-Host "输入无效，该模式不允许相同目录、父子目录或互相包含的目录，请重新输入。" -ForegroundColor Yellow
-            }
-            else {
-                Write-Host "路径无效，请不要重复输入同一个目录。本次输入不保留。" -ForegroundColor Yellow
-            }
+            Write-Host "路径无效，请不要输入相同目录、父子目录或互相包含的目录。本次输入不保留。" -ForegroundColor Yellow
             continue
         }
 
@@ -670,7 +664,7 @@ function Get-RelativePathCompat {
     return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
 }
 
-# 合并或参考模式必须使用互不包含的目录，避免同一文件被重复扫描后匹配到自身。
+# 同一次扫描中的目录必须互不包含，避免同一文件被重复扫描或重复处理。
 function Test-IndependentDirectoryPair {
     param(
         [Parameter(Mandatory = $true)]
@@ -705,25 +699,7 @@ function Test-IndependentDirectoryPair {
     }
 }
 
-# 单目录模式允许父子目录分别处理，但不允许同一目录重复输入。
-function Test-UniqueDirectorySet {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$RootPathList
-    )
-
-    for ($leftIndex = 0; $leftIndex -lt $RootPathList.Count; $leftIndex++) {
-        $normalizedLeftPath = ConvertTo-NormalizedDirectoryPath -Path $RootPathList[$leftIndex]
-        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $RootPathList.Count; $rightIndex++) {
-            $normalizedRightPath = ConvertTo-NormalizedDirectoryPath -Path $RootPathList[$rightIndex]
-            if ($normalizedLeftPath.Equals($normalizedRightPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "Path$($leftIndex + 1) 和 Path$($rightIndex + 1) 不能是同一个目录。"
-            }
-        }
-    }
-}
-
-# 校验一组目录两两独立；用于多目录合并和多目标参考模式。
+# 校验一组目录两两独立，避免同一文件在一次运行中被重复扫描或重复处理。
 function Test-IndependentDirectorySet {
     param(
         [Parameter(Mandatory = $true)]
@@ -739,24 +715,6 @@ function Test-IndependentDirectorySet {
                 -RightName "Path$($rightIndex + 1)"
         }
     }
-}
-
-# 按当前扫描模式校验目录集合；单目录模式只禁止重复目录，合并/参考模式禁止互相包含。
-function Test-DirectorySetForMode {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$RootPathList,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$RequireIndependentDirectorySet
-    )
-
-    if ($RequireIndependentDirectorySet) {
-        Test-IndependentDirectorySet -RootPathList $RootPathList
-        return
-    }
-
-    Test-UniqueDirectorySet -RootPathList $RootPathList
 }
 
 # ========== 哈希与重复文件识别 ==========
@@ -819,16 +777,22 @@ function Get-FullContentHash {
 }
 
 # 递归获取目录下所有普通文件；默认不包含隐藏项，传入 -s 时包含隐藏文件和隐藏文件夹。
-function Get-ScannedFiles {
+function Get-ScannedFileList {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RootPath,
 
         [Parameter(Mandatory = $false)]
-        [string]$ProgressLabel = '目录'
+        [string]$ProgressLabel = '目录',
+
+        [Parameter(Mandatory = $false)]
+        [switch]$SuppressScanStageMessages
     )
 
-    Write-StageMessage "开始扫描$($ProgressLabel): $RootPath"
+    if (-not $SuppressScanStageMessages) {
+        Write-StageMessage "开始扫描$($ProgressLabel): $RootPath"
+    }
+
     $scanErrorList = $null
     if ($ShouldIncludeHiddenItems) {
         $scannedFiles = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrorList)
@@ -837,13 +801,21 @@ function Get-ScannedFiles {
         $scannedFiles = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrorList)
     }
 
-    foreach ($scanError in @($scanErrorList)) {
+    $scanErrors = @($scanErrorList)
+    if ($SuppressScanStageMessages -and $scanErrors.Count -gt 0) {
+        Complete-ProgressBar
+    }
+
+    foreach ($scanError in $scanErrors) {
         Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
         Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
     }
 
     $hiddenScopeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
-    Write-StageMessage "$($ProgressLabel)扫描完成，文件数: $($scannedFiles.Count)，$hiddenScopeText"
+    if (-not $SuppressScanStageMessages) {
+        Write-StageMessage "$($ProgressLabel)扫描完成，文件数: $($scannedFiles.Count)，$hiddenScopeText"
+    }
+
     return $scannedFiles
 }
 
@@ -909,8 +881,8 @@ function Get-DirectoryPathDepth {
     return @($Path -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
 }
 
-# 按默认保留规则排序文件：先比较所在目录，再用文件名作为同目录兜底。
-function Get-FilesByKeepPriority {
+# 按默认保留规则排序文件：目录越靠上越优先，同目录内文件名越短越优先。
+function Get-FileListByKeepPriority {
     param(
         [Parameter(Mandatory = $true)]
         [System.IO.FileInfo[]]$FileList
@@ -931,10 +903,10 @@ function Select-DefaultKeepFile {
         [System.IO.FileInfo[]]$FileList
     )
 
-    return Get-FilesByKeepPriority -FileList $FileList | Select-Object -First 1
+    return Get-FileListByKeepPriority -FileList $FileList | Select-Object -First 1
 }
 
-# 按单目录根路径或预先建立的映射获取文件显示路径。
+# 按单目录根路径、目录前缀或预先建立的映射获取文件显示路径。
 function Get-FileDisplayPath {
     param(
         [Parameter(Mandatory = $true)]
@@ -942,6 +914,9 @@ function Get-FileDisplayPath {
 
         [Parameter(Mandatory = $false)]
         [string]$RootPath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PathPrefix,
 
         [Parameter(Mandatory = $false)]
         [hashtable]$DisplayPathByFullName
@@ -952,14 +927,14 @@ function Get-FileDisplayPath {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($RootPath)) {
-        return Get-RelativePathText -File $File -RootPath $RootPath
+        return Get-RelativePathText -File $File -RootPath $RootPath -PathPrefix $PathPrefix
     }
 
     return $File.FullName
 }
 
 # 将待删除文件封装为包含文件对象和显示路径的删除项。
-function New-DeletionItems {
+function New-DeletionItemList {
     param(
         [Parameter(Mandatory = $true)]
         [System.IO.FileInfo[]]$FileList,
@@ -976,17 +951,7 @@ function New-DeletionItems {
 
     return @(
         $FileList | ForEach-Object {
-            $displayPath = if ($null -ne $DisplayPathByFullName -and $DisplayPathByFullName.ContainsKey($_.FullName)) {
-                $DisplayPathByFullName[$_.FullName]
-            }
-            else {
-                if ([string]::IsNullOrWhiteSpace($RootPath)) {
-                    $_.FullName
-                }
-                else {
-                    Get-RelativePathText -File $_ -RootPath $RootPath -PathPrefix $PathPrefix
-                }
-            }
+            $displayPath = Get-FileDisplayPath -File $_ -RootPath $RootPath -PathPrefix $PathPrefix -DisplayPathByFullName $DisplayPathByFullName
 
             [pscustomobject]@{
                 File        = $_
@@ -997,7 +962,7 @@ function New-DeletionItems {
 }
 
 # 按文件大小、部分哈希、完整哈希分层筛选出内容完全一致的重复文件组。
-function Find-DuplicateFileGroups {
+function Find-DuplicateFileGroup {
     param(
         [Parameter(Mandatory = $true)]
         [System.IO.FileInfo[]]$FileList,
@@ -1123,30 +1088,53 @@ function Write-DuplicatePreviewBlock {
     }
 }
 
-# 输出所有默认删除计划的预览，并返回预计删除数量。
+# 输出默认删除计划摘要，并返回预计删除数量。
+function Write-DeletionPlanSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$DeletionPlanList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SummaryMessageTemplate
+    )
+
+    $plannedDeletionCount = 0
+    $plannedKeepCount = 0
+    foreach ($deletionPlan in $DeletionPlanList) {
+        $plannedDeletionItems = @($deletionPlan.DeletionItems)
+        $plannedDeletionCount += $plannedDeletionItems.Count
+        $plannedKeepCount++
+    }
+
+    Write-Host ""
+    Write-Host -NoNewline "重复组数: " -ForegroundColor White
+    Write-Host -NoNewline $DeletionPlanList.Count -ForegroundColor Cyan
+    Write-Host -NoNewline "，默认保留文件数: " -ForegroundColor White
+    Write-Host -NoNewline $plannedKeepCount -ForegroundColor Green
+    Write-Host -NoNewline "，默认计划删除文件数: " -ForegroundColor White
+    Write-Host $plannedDeletionCount -ForegroundColor Red
+    Write-StatusSummary -Message ($SummaryMessageTemplate -f $plannedDeletionCount) -Color Yellow
+    return $plannedDeletionCount
+}
+
+# 输出默认删除计划的详细预览与摘要，并返回预计删除数量。
 function Write-DeletionPlanPreview {
     param(
         [Parameter(Mandatory = $true)]
         [object[]]$DeletionPlanList,
 
         [Parameter(Mandatory = $true)]
-        [string]$SummaryFormat
+        [string]$SummaryMessageTemplate
     )
 
     Write-Host "`n删除预览:" -ForegroundColor Yellow
-    $plannedDeletionCount = 0
-    $plannedKeepCount = 0
     foreach ($deletionPlan in $DeletionPlanList) {
         $plannedDeletionItems = @($deletionPlan.DeletionItems)
         $plannedDeletePathTexts = @($plannedDeletionItems | ForEach-Object { $_.DisplayPath })
         Write-DuplicatePreviewBlock -Hash $deletionPlan.Hash -KeepPathText $deletionPlan.KeepPathText -DeletePathTexts $plannedDeletePathTexts
-        $plannedDeletionCount += $plannedDeletionItems.Count
-        $plannedKeepCount++
     }
 
-    Write-Host "重复组数: $($DeletionPlanList.Count)，默认保留文件数: $plannedKeepCount，默认计划删除文件数: $plannedDeletionCount" -ForegroundColor DarkGray
-    Write-StatusSummary -Message ($SummaryFormat -f $plannedDeletionCount) -Color Yellow
-    return $plannedDeletionCount
+    return (Write-DeletionPlanSummary -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $SummaryMessageTemplate)
 }
 
 # 输出手动模式下本组已删除文件的原编号和相对路径。
@@ -1188,7 +1176,7 @@ function Read-ManualDeletionSelection {
         [string]$Hash
     )
 
-    $orderedDuplicateFiles = @(Get-FilesByKeepPriority -FileList $DuplicateFileGroup)
+    $orderedDuplicateFiles = @(Get-FileListByKeepPriority -FileList $DuplicateFileGroup)
     $defaultDeletionSelections = @(
         for ($index = 0; $index -lt $orderedDuplicateFiles.Count; $index++) {
             if ($orderedDuplicateFiles[$index].FullName -ne $DefaultKeepFile.FullName) {
@@ -1290,7 +1278,7 @@ function Read-ManualDeletionSelection {
 }
 
 # 执行一批删除项，并返回实际删除与失败数量。
-function Remove-DeletionItems {
+function Remove-DeletionItemList {
     param(
         [Parameter(Mandatory = $true)]
         [object[]]$DeletionItemList,
@@ -1332,11 +1320,11 @@ function Invoke-DefaultDeletionPlan {
         [object[]]$DeletionPlanList,
 
         [Parameter(Mandatory = $true)]
-        [string]$SummaryFormat
+        [string]$SummaryMessageTemplate
     )
 
-    $deletionResult = Remove-DeletionItems -DeletionItemList @($DeletionPlanList | ForEach-Object { $_.DeletionItems })
-    Write-StatusSummary -Message ($SummaryFormat -f $deletionResult.DeletedCount) -Color Magenta
+    $deletionResult = Remove-DeletionItemList -DeletionItemList @($DeletionPlanList | ForEach-Object { $_.DeletionItems })
+    Write-StatusSummary -Message ($SummaryMessageTemplate -f $deletionResult.DeletedCount) -Color Magenta
     if ($deletionResult.FailedCount -gt 0) {
         Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
     }
@@ -1344,17 +1332,14 @@ function Invoke-DefaultDeletionPlan {
     return $deletionResult
 }
 
-# 生成删除操作菜单选项；多单目录操作时可把 0 作为跳过当前目录。
-function New-DeletionActionMenuOptions {
+# 生成删除操作菜单选项；0 只表示跳过或返回，00 统一表示退出脚本。
+function New-DeletionActionMenuOptionList {
     param(
         [Parameter(Mandatory = $false)]
         [switch]$IncludeManualDeletion,
 
         [Parameter(Mandatory = $false)]
-        [switch]$IncludeSkipCurrentDirectory,
-
-        [Parameter(Mandatory = $false)]
-        [switch]$IncludeExitScript
+        [switch]$IncludeSkipCurrentDirectory
     )
 
     $menuOptionList = New-Object System.Collections.Generic.List[object]
@@ -1366,11 +1351,9 @@ function New-DeletionActionMenuOptions {
         $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '跳过当前目录' })
     }
     else {
-        $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '退出' })
+        $menuOptionList.Add([pscustomobject]@{ Value = '0'; Label = '跳过本次操作' })
     }
-    if ($IncludeExitScript) {
-        $menuOptionList.Add([pscustomobject]@{ Value = '00'; Label = '退出脚本' })
-    }
+    $menuOptionList.Add([pscustomobject]@{ Value = '00'; Label = '退出脚本' })
 
     return $menuOptionList.ToArray()
 }
@@ -1419,14 +1402,14 @@ function Read-InteractiveScanMode {
         [pscustomobject]@{ Value = '1'; Label = '单目录模式（每个目录分别扫描）' }
         [pscustomobject]@{ Value = '2'; Label = '多目录合并模式（多个目录视作一个大目录）' }
         [pscustomobject]@{ Value = '3'; Label = '参考目录模式（首个目录作为参考目录）' }
-        [pscustomobject]@{ Value = '0'; Label = '退出脚本' }
+        [pscustomobject]@{ Value = '00'; Label = '退出脚本' }
     )
 
     switch ($modeChoice) {
         '1' { return 'Single' }
         '2' { return 'Aggregate' }
         '3' { return 'Reference' }
-        '0' { return 'Exit' }
+        '00' { return 'Exit' }
     }
 }
 
@@ -1444,8 +1427,8 @@ function Get-ScanModeMinimumPathCount {
     return 1
 }
 
-# 根据当前模式返回用户可读的模式名称。
-function Get-ScanModeName {
+# 根据当前模式返回路径输入阶段的模式提示。
+function Get-ScanModePrompt {
     param(
         [Parameter(Mandatory = $true)]
         [bool]$UseReferenceMode,
@@ -1455,14 +1438,14 @@ function Get-ScanModeName {
     )
 
     if ($UseReferenceMode) {
-        return '参考目录模式'
+        return '参考目录模式：首个目录作为参考目录，其余目录作为目标目录'
     }
 
     if ($UseAggregateMode) {
-        return '多目录合并模式'
+        return '多目录合并模式：多个目录将视作一个大目录扫描'
     }
 
-    return '单目录模式'
+    return '单目录模式：每个目录将分别扫描'
 }
 
 # 为单目录模式生成默认删除计划。
@@ -1472,12 +1455,12 @@ function New-SingleDirectoryDeletionPlan {
         [string]$RootPath
     )
 
-    $scannedFiles = @(Get-ScannedFiles -RootPath $RootPath -ProgressLabel '单目录')
+    $scannedFiles = @(Get-ScannedFileList -RootPath $RootPath -ProgressLabel '单目录')
     if ($scannedFiles.Count -lt 2) {
         return @()
     }
 
-    foreach ($duplicateGroupRecord in Find-DuplicateFileGroups -FileList $scannedFiles -ProgressLabel '单目录') {
+    foreach ($duplicateGroupRecord in Find-DuplicateFileGroup -FileList $scannedFiles -ProgressLabel '单目录') {
         $duplicateFiles = @($duplicateGroupRecord.Files)
         $defaultKeepFile = Select-DefaultKeepFile -FileList $duplicateFiles
         $filesToDelete = @($duplicateFiles | Where-Object { $_.FullName -ne $defaultKeepFile.FullName })
@@ -1486,7 +1469,7 @@ function New-SingleDirectoryDeletionPlan {
             Hash           = $duplicateGroupRecord.Hash
             KeepFile      = $defaultKeepFile
             KeepPathText  = Get-RelativePathText -File $defaultKeepFile -RootPath $RootPath
-            DeletionItems = New-DeletionItems -FileList $filesToDelete -RootPath $RootPath
+            DeletionItems = New-DeletionItemList -FileList $filesToDelete -RootPath $RootPath
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1500,10 +1483,20 @@ function New-MergedDirectoryDeletionPlan {
     )
 
     $fileRecordList = New-Object System.Collections.Generic.List[object]
+    $mergedScanFileCount = 0
+    $lastMergedScanPercent = -1
+    $hiddenScopeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
+
+    Write-StageMessage "开始扫描合并目录，目录数: $($RootPathList.Count)"
     for ($rootIndex = 0; $rootIndex -lt $RootPathList.Count; $rootIndex++) {
         $rootPath = $RootPathList[$rootIndex]
-        $pathPrefix = "{0}-{1}" -f ($rootIndex + 1), (Get-DirectoryLabel -RootPath $rootPath)
-        $scannedFiles = @(Get-ScannedFiles -RootPath $rootPath -ProgressLabel "合并目录$($rootIndex + 1)")
+        $rootNumber = $rootIndex + 1
+        $rootLabel = Get-DirectoryLabel -RootPath $rootPath
+        $pathPrefix = "{0}-{1}" -f $rootNumber, $rootLabel
+
+        Write-ProgressBar -Activity '合并目录扫描' -Status "正在扫描目录 $rootNumber：$rootLabel" -ProcessedCount $rootIndex -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
+        $scannedFiles = @(Get-ScannedFileList -RootPath $rootPath -ProgressLabel "合并目录$rootNumber" -SuppressScanStageMessages)
+        $mergedScanFileCount += $scannedFiles.Count
 
         foreach ($file in $scannedFiles) {
             $fileRecordList.Add([pscustomobject]@{
@@ -1512,6 +1505,9 @@ function New-MergedDirectoryDeletionPlan {
             })
         }
     }
+    Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
+    Complete-ProgressBar
+    Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
 
     $scannedFileList = @($fileRecordList | ForEach-Object { $_.File })
     if ($scannedFileList.Count -lt 2) {
@@ -1523,7 +1519,7 @@ function New-MergedDirectoryDeletionPlan {
         $displayPathByFullName[$fileRecord.File.FullName] = $fileRecord.DisplayPath
     }
 
-    foreach ($duplicateGroupRecord in Find-DuplicateFileGroups -FileList $scannedFileList -ProgressLabel '多目录合并') {
+    foreach ($duplicateGroupRecord in Find-DuplicateFileGroup -FileList $scannedFileList -ProgressLabel '多目录合并') {
         $duplicateFiles = @($duplicateGroupRecord.Files)
         $defaultKeepFile = Select-DefaultKeepFile -FileList $duplicateFiles
         $filesToDelete = @($duplicateFiles | Where-Object { $_.FullName -ne $defaultKeepFile.FullName })
@@ -1532,7 +1528,7 @@ function New-MergedDirectoryDeletionPlan {
             Hash           = $duplicateGroupRecord.Hash
             KeepFile       = $defaultKeepFile
             KeepPathText   = $displayPathByFullName[$defaultKeepFile.FullName]
-            DeletionItems  = New-DeletionItems -FileList $filesToDelete -DisplayPathByFullName $displayPathByFullName
+            DeletionItems  = New-DeletionItemList -FileList $filesToDelete -DisplayPathByFullName $displayPathByFullName
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1595,9 +1591,9 @@ function Invoke-ManualDeletion {
             continue
         }
 
-        $manualDeletionItems = New-DeletionItems -FileList $selectedFilesToDelete -RootPath $RootPath -DisplayPathByFullName $DisplayPathByFullName
+        $manualDeletionItems = New-DeletionItemList -FileList $selectedFilesToDelete -RootPath $RootPath -DisplayPathByFullName $DisplayPathByFullName
 
-        $deletionResult = Remove-DeletionItems -DeletionItemList $manualDeletionItems -Quiet
+        $deletionResult = Remove-DeletionItemList -DeletionItemList $manualDeletionItems -Quiet
         $deletedSelectionList = @(
             foreach ($selectedDeletionEntry in $selectedDeletionEntries) {
                 if (@($deletionResult.DeletedItems | Where-Object { $_.File.FullName -eq $selectedDeletionEntry.File.FullName }).Count -gt 0) {
@@ -1653,10 +1649,10 @@ function Invoke-DeletionPlanAction {
         [string]$EmptyMessage,
 
         [Parameter(Mandatory = $true)]
-        [string]$PreviewSummaryFormat,
+        [string]$PreviewSummaryMessageTemplate,
 
         [Parameter(Mandatory = $true)]
-        [string]$DefaultDeletionSummaryFormat,
+        [string]$DefaultDeletionSummaryMessageTemplate,
 
         [Parameter(Mandatory = $false)]
         [switch]$IncludeManualDeletion,
@@ -1677,16 +1673,18 @@ function Invoke-DeletionPlanAction {
     }
 
     if ($ShouldAssumeYesDeletion) {
+        [void](Write-DeletionPlanSummary -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $PreviewSummaryMessageTemplate)
+
         if (-not (Wait-AssumeYesDeletionGracePeriod)) {
             return 'Exit'
         }
 
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat $DefaultDeletionSummaryFormat)
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $DefaultDeletionSummaryMessageTemplate)
         return 'Continue'
     }
 
-    [void](Write-DeletionPlanPreview -DeletionPlanList $DeletionPlanList -SummaryFormat $PreviewSummaryFormat)
-    $menuOptionList = New-DeletionActionMenuOptions -IncludeManualDeletion:$IncludeManualDeletion -IncludeSkipCurrentDirectory:$AllowSkipCurrentDirectory -IncludeExitScript:$AllowSkipCurrentDirectory
+    [void](Write-DeletionPlanPreview -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $PreviewSummaryMessageTemplate)
+    $menuOptionList = New-DeletionActionMenuOptionList -IncludeManualDeletion:$IncludeManualDeletion -IncludeSkipCurrentDirectory:$AllowSkipCurrentDirectory
     $menuChoice = Read-DeletionAction -MenuOptionList $menuOptionList
 
     if ($menuChoice -eq '0') {
@@ -1695,8 +1693,8 @@ function Invoke-DeletionPlanAction {
             return 'Skip'
         }
 
-        Write-Host "已退出脚本，未删除任何文件。" -ForegroundColor Yellow
-        return 'Exit'
+        Write-Host "已跳过本次操作，未删除任何文件。" -ForegroundColor Yellow
+        return 'Continue'
     }
 
     if ($menuChoice -eq '00') {
@@ -1705,7 +1703,7 @@ function Invoke-DeletionPlanAction {
     }
 
     if ($menuChoice -eq '1') {
-        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryFormat $DefaultDeletionSummaryFormat)
+        [void](Invoke-DefaultDeletionPlan -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $DefaultDeletionSummaryMessageTemplate)
         return 'Continue'
     }
 
@@ -1731,13 +1729,13 @@ function Invoke-SingleDirectoryDeletionAction {
     )
 
     $actionParameters = @{
-        DeletionPlanList             = $DeletionPlanList
-        EmptyMessage                 = '未发现重复文件。'
-        PreviewSummaryFormat         = '重复文件列举完成。默认计划删除重复文件: {0}'
-        DefaultDeletionSummaryFormat = '删除完成。已删除重复文件: {0}'
-        IncludeManualDeletion        = $true
-        AllowSkipCurrentDirectory    = $AllowSkipCurrentDirectory
-        ManualRootPath               = $RootPath
+        DeletionPlanList                      = $DeletionPlanList
+        EmptyMessage                          = '未发现重复文件。'
+        PreviewSummaryMessageTemplate         = '重复文件列举完成。默认计划删除重复文件: {0}'
+        DefaultDeletionSummaryMessageTemplate = '删除完成。已删除重复文件: {0}'
+        IncludeManualDeletion                 = $true
+        AllowSkipCurrentDirectory             = $AllowSkipCurrentDirectory
+        ManualRootPath                        = $RootPath
     }
 
     return (Invoke-DeletionPlanAction @actionParameters)
@@ -1751,19 +1749,18 @@ function Invoke-SingleDirectoryMode {
     )
 
     $deletionPlanList = @(New-SingleDirectoryDeletionPlan -RootPath $RootPath)
-    [void](Invoke-SingleDirectoryDeletionAction -RootPath $RootPath -DeletionPlanList $deletionPlanList)
+    return (Invoke-SingleDirectoryDeletionAction -RootPath $RootPath -DeletionPlanList $deletionPlanList)
 }
 
 # 多个单目录先全部扫描，再按目录逐个预览和确认，避免扫描过程中被菜单反复打断。
-function Invoke-IndependentSingleDirectoryMode {
+function Invoke-SeparateSingleDirectoryMode {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$RootPathList
     )
 
     if ($RootPathList.Count -eq 1) {
-        Invoke-SingleDirectoryMode -RootPath $RootPathList[0]
-        return
+        return (Invoke-SingleDirectoryMode -RootPath $RootPathList[0])
     }
 
     $singleDirectoryPlanRecordList = New-Object System.Collections.Generic.List[object]
@@ -1790,7 +1787,7 @@ function Invoke-IndependentSingleDirectoryMode {
     $actionDirectoryCount = $actionPlanRecordList.Count
     Write-StatusSummary -Message "单目录模式扫描完成。待操作目录: $actionDirectoryCount / $($RootPathList.Count)" -Color Cyan
     if ($actionDirectoryCount -eq 0) {
-        return
+        return 'Continue'
     }
 
     for ($recordIndex = 0; $recordIndex -lt $actionPlanRecordList.Count; $recordIndex++) {
@@ -1800,9 +1797,11 @@ function Invoke-IndependentSingleDirectoryMode {
 
         $operationResult = Invoke-SingleDirectoryDeletionAction -RootPath $planRecord.RootPath -DeletionPlanList @($planRecord.DeletionPlanList) -AllowSkipCurrentDirectory
         if ($operationResult -eq 'Exit' -or $AssumeYesDeletionCancelled) {
-            return
+            return 'Exit'
         }
     }
+
+    return 'Continue'
 }
 
 # 多目录合并模式入口：先把所有目录视作一个虚拟大目录，再按用户选择默认或手动删除。
@@ -1815,14 +1814,14 @@ function Invoke-MergedDirectoryMode {
     $deletionPlanList = @(New-MergedDirectoryDeletionPlan -RootPathList $RootPathList)
     $displayPathByFullName = New-DisplayPathMapFromDeletionPlan -DeletionPlanList $deletionPlanList
     $actionParameters = @{
-        DeletionPlanList             = $deletionPlanList
-        EmptyMessage                 = '未发现重复文件。'
-        PreviewSummaryFormat         = '重复文件列举完成。默认计划从多目录合并结果中删除重复文件: {0}'
-        DefaultDeletionSummaryFormat = '删除完成。已从多目录合并结果中删除重复文件: {0}'
-        IncludeManualDeletion        = $true
-        ManualDisplayPathByFullName  = $displayPathByFullName
+        DeletionPlanList                      = $deletionPlanList
+        EmptyMessage                          = '未发现重复文件。'
+        PreviewSummaryMessageTemplate         = '重复文件列举完成。默认计划从多目录合并结果中删除重复文件: {0}'
+        DefaultDeletionSummaryMessageTemplate = '删除完成。已从多目录合并结果中删除重复文件: {0}'
+        IncludeManualDeletion                 = $true
+        ManualDisplayPathByFullName           = $displayPathByFullName
     }
-    [void](Invoke-DeletionPlanAction @actionParameters)
+    return (Invoke-DeletionPlanAction @actionParameters)
 }
 
 # 为参考目录模式建立轻量参考索引；这里只按文件大小分组，不读取文件内容。
@@ -1832,7 +1831,7 @@ function New-ReferenceDirectoryIndex {
         [string]$ReferenceRootPath
     )
 
-    $referenceFileList = @(Get-ScannedFiles -RootPath $ReferenceRootPath -ProgressLabel '参考目录')
+    $referenceFileList = @(Get-ScannedFileList -RootPath $ReferenceRootPath -ProgressLabel '参考目录')
     $referenceFilesByLength = @{}
     $indexedReferenceFileCount = 0
 
@@ -2003,7 +2002,7 @@ function New-ReferenceDirectoryDeletionPlan {
     )
 
     $referenceFileList = @($ReferenceIndex.FileList)
-    $targetFileList = @(Get-ScannedFiles -RootPath $TargetRootPath -ProgressLabel '目标目录')
+    $targetFileList = @(Get-ScannedFileList -RootPath $TargetRootPath -ProgressLabel '目标目录')
     if ($referenceFileList.Count -eq 0 -or $ReferenceIndex.IndexedFileCount -eq 0 -or $targetFileList.Count -eq 0) {
         return @()
     }
@@ -2086,7 +2085,7 @@ function New-ReferenceDirectoryDeletionPlan {
         [pscustomobject]@{
             Hash          = $matchRecord.Hash
             KeepPathText = Get-RelativePathText -File $referenceKeepFile -RootPath $referenceRootPath -PathPrefix $referencePathPrefix
-            DeletionItems = New-DeletionItems -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
+            DeletionItems = New-DeletionItemList -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
         }
     }
 }
@@ -2104,7 +2103,7 @@ function Invoke-ReferenceDirectoryMode {
     $referenceIndex = New-ReferenceDirectoryIndex -ReferenceRootPath $ReferenceRootPath
     if (@($referenceIndex.FileList).Count -eq 0) {
         Write-Host "未发现目标目录中存在与参考目录重复的文件。" -ForegroundColor Green
-        return
+        return 'Continue'
     }
 
     $deletionPlanList = @(
@@ -2119,12 +2118,44 @@ function Invoke-ReferenceDirectoryMode {
     )
 
     $actionParameters = @{
-        DeletionPlanList             = $deletionPlanList
-        EmptyMessage                 = '未发现目标目录中存在与参考目录重复的文件。'
-        PreviewSummaryFormat         = '重复文件列举完成。默认计划从目标目录删除重复文件: {0}'
-        DefaultDeletionSummaryFormat = '删除完成。已从目标目录删除重复文件: {0}'
+        DeletionPlanList                      = $deletionPlanList
+        EmptyMessage                          = '未发现目标目录中存在与参考目录重复的文件。'
+        PreviewSummaryMessageTemplate         = '重复文件列举完成。默认计划从目标目录删除重复文件: {0}'
+        DefaultDeletionSummaryMessageTemplate = '删除完成。已从目标目录删除重复文件: {0}'
     }
-    [void](Invoke-DeletionPlanAction @actionParameters)
+    return (Invoke-DeletionPlanAction @actionParameters)
+}
+
+# 校验路径并执行一轮扫描流程；返回 Continue 或 Exit，供交互菜单判断后续动作。
+function Invoke-DuplicateScanRun {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$InputPathList,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$UseAggregateMode,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$UseReferenceMode
+    )
+
+    $minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $UseReferenceMode
+    if ($InputPathList.Count -lt $minimumPathCount) {
+        throw "当前模式至少需要输入 $minimumPathCount 个目录。"
+    }
+
+    $resolvedPathList = @(Resolve-InputDirectoryList -PathList $InputPathList)
+    Test-IndependentDirectorySet -RootPathList $resolvedPathList
+
+    if ($UseReferenceMode) {
+        return (Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList @($resolvedPathList | Select-Object -Skip 1))
+    }
+    elseif ($UseAggregateMode) {
+        return (Invoke-MergedDirectoryMode -RootPathList $resolvedPathList)
+    }
+    else {
+        return (Invoke-SeparateSingleDirectoryMode -RootPathList $resolvedPathList)
+    }
 }
 
 if ($Help) {
@@ -2140,93 +2171,94 @@ if ($AggregateMode -and $ReferenceMode) {
 $useAggregateMode = [bool]$AggregateMode
 $useReferenceMode = [bool]$ReferenceMode
 $inputPathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$hasCommandLinePathList = $inputPathList.Count -gt 0
 
 Write-EnabledOptionNotice -IncludeHiddenItems $ShouldIncludeHiddenItems -AssumeYesDeletion $ShouldAssumeYesDeletion
 
-if ($inputPathList.Count -eq 0) {
+if (-not $hasCommandLinePathList) {
     $shouldReadScanMode = -not $useAggregateMode -and -not $useReferenceMode
-    $hasInteractivePathList = $false
 
-    while (-not $hasInteractivePathList) {
-        if ($shouldReadScanMode) {
-            $selectedScanMode = Read-InteractiveScanMode
-            switch ($selectedScanMode) {
-                'Single' {
+    while ($true) {
+        $hasInteractivePathList = $false
+
+        while (-not $hasInteractivePathList) {
+            if ($shouldReadScanMode) {
+                $selectedScanMode = Read-InteractiveScanMode
+                switch ($selectedScanMode) {
+                    'Single' {
+                        $useAggregateMode = $false
+                        $useReferenceMode = $false
+                    }
+                    'Aggregate' {
+                        $useAggregateMode = $true
+                        $useReferenceMode = $false
+                    }
+                    'Reference' {
+                        $useAggregateMode = $false
+                        $useReferenceMode = $true
+                    }
+                    'Exit' {
+                        Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+                        exit 0
+                    }
+                }
+            }
+
+            $minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $useReferenceMode
+            $modePrompt = Get-ScanModePrompt -UseReferenceMode $useReferenceMode -UseAggregateMode $useAggregateMode
+            $pathInputResult = Read-InteractivePathList -ModePrompt $modePrompt -MinimumCount $minimumPathCount
+
+            switch ($pathInputResult.Action) {
+                'Submit' {
+                    $inputPathList = @($pathInputResult.PathList)
+                    $hasInteractivePathList = $true
+                }
+                'Back' {
+                    Write-Host "已返回上级菜单。" -ForegroundColor Yellow
                     $useAggregateMode = $false
                     $useReferenceMode = $false
-                }
-                'Aggregate' {
-                    $useAggregateMode = $true
-                    $useReferenceMode = $false
-                }
-                'Reference' {
-                    $useAggregateMode = $false
-                    $useReferenceMode = $true
+                    $shouldReadScanMode = $true
                 }
                 'Exit' {
                     Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
                     exit 0
                 }
+                default {
+                    Write-Host "路径输入返回了未知状态: $($pathInputResult.Action)" -ForegroundColor Red
+                    exit 1
+                }
             }
         }
 
-        $minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $useReferenceMode
-        $modeName = Get-ScanModeName -UseReferenceMode $useReferenceMode -UseAggregateMode $useAggregateMode
-        $pathInputResult = Read-InteractivePathList -ModeName $modeName -MinimumCount $minimumPathCount -RequireIndependentDirectorySet:($useReferenceMode -or $useAggregateMode)
-
-        switch ($pathInputResult.Action) {
-            'Submit' {
-                $inputPathList = @($pathInputResult.PathList)
-                $hasInteractivePathList = $true
-            }
-            'Back' {
-                Write-Host "已返回上级菜单。" -ForegroundColor Yellow
-                $useAggregateMode = $false
-                $useReferenceMode = $false
-                $shouldReadScanMode = $true
-            }
-            'Exit' {
-                Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
-                exit 0
-            }
-            default {
-                Write-Host "路径输入返回了未知状态: $($pathInputResult.Action)" -ForegroundColor Red
-                exit 1
-            }
+        try {
+            $scanRunResult = Invoke-DuplicateScanRun -InputPathList $inputPathList -UseAggregateMode $useAggregateMode -UseReferenceMode $useReferenceMode
         }
+        catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            $scanRunResult = 'Continue'
+        }
+
+        if ($scanRunResult -eq 'Exit' -or $AssumeYesDeletionCancelled) {
+            exit 0
+        }
+
+        Write-Host ""
+        Write-Host "本轮流程完成，返回扫描模式菜单。" -ForegroundColor Cyan
+        $inputPathList = @()
+        $useAggregateMode = $false
+        $useReferenceMode = $false
+        $shouldReadScanMode = $true
     }
 }
 
-$minimumPathCount = Get-ScanModeMinimumPathCount -UseReferenceMode $useReferenceMode
-$modeName = Get-ScanModeName -UseReferenceMode $useReferenceMode -UseAggregateMode $useAggregateMode
-
-if ($inputPathList.Count -lt $minimumPathCount) {
-    Write-Host "$modeName 至少需要输入 $minimumPathCount 个目录。" -ForegroundColor Red
-    exit 1
-}
-
 try {
-    $resolvedPathList = @(Resolve-InputDirectoryList -PathList $inputPathList)
+    $scanRunResult = Invoke-DuplicateScanRun -InputPathList $inputPathList -UseAggregateMode $useAggregateMode -UseReferenceMode $useReferenceMode
 }
 catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1
 }
 
-try {
-    Test-DirectorySetForMode -RootPathList $resolvedPathList -RequireIndependentDirectorySet:($useReferenceMode -or $useAggregateMode)
-}
-catch {
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    exit 1
-}
-
-if ($useReferenceMode) {
-    Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList @($resolvedPathList | Select-Object -Skip 1)
-}
-elseif ($useAggregateMode) {
-    Invoke-MergedDirectoryMode -RootPathList $resolvedPathList
-}
-else {
-    Invoke-IndependentSingleDirectoryMode -RootPathList $resolvedPathList
+if ($scanRunResult -eq 'Exit' -or $AssumeYesDeletionCancelled) {
+    exit 0
 }

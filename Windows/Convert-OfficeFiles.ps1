@@ -277,7 +277,7 @@ function Get-RelativePathText {
 }
 
 # 递归扫描旧格式 Office 文件；扫描错误只记录，不中断整个脚本。
-function Get-LegacyOfficeFiles {
+function Get-LegacyOfficeFileList {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RootPath
@@ -309,13 +309,13 @@ function Get-LegacyOfficeFiles {
 }
 
 # 根据扫描结果生成转换计划；目标文件已存在时标记为跳过，避免覆盖。
-function New-ConversionPlans {
+function New-ConversionPlanList {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RootPath
     )
 
-    $legacyFiles = @(Get-LegacyOfficeFiles -RootPath $RootPath)
+    $legacyFiles = @(Get-LegacyOfficeFileList -RootPath $RootPath)
     $plans = [System.Collections.Generic.List[object]]::new()
     $processedCount = 0
     $lastPercent = -1
@@ -623,7 +623,7 @@ function Convert-OfficeFile {
 }
 
 # 统一退出已启动的 Office 应用，并触发垃圾回收清理 COM 引用。
-function Close-OfficeApplications {
+function Close-OfficeApplicationCache {
     param(
         [Parameter(Mandatory = $true)]
         [hashtable]$ApplicationCache
@@ -647,7 +647,7 @@ function Close-OfficeApplications {
 }
 
 # 在 Office 应用退出后统一移动临时文件到目标位置，并用进度条展示移动进度。
-function Move-ConvertedOfficeFiles {
+function Move-ConvertedOfficeFileList {
     param(
         [Parameter(Mandatory = $true)]
         [object[]]$TempConversionResults
@@ -730,7 +730,7 @@ function Move-ConvertedOfficeFiles {
 }
 
 # 执行转换计划：先输出跳过项，再逐个转换待处理文件并汇总结果。
-function Invoke-ConversionPlans {
+function Invoke-ConversionPlanList {
     param(
         [Parameter(Mandatory = $true)]
         [object[]]$ConversionPlans
@@ -786,7 +786,7 @@ function Invoke-ConversionPlans {
             $closeStatusLineLength = Write-RefreshStatusLine -Message '正在退出 Office 应用...' -Color White -NoNewLine
         }
 
-        Close-OfficeApplications -ApplicationCache $applicationCache
+        Close-OfficeApplicationCache -ApplicationCache $applicationCache
 
         if ($applicationCache.Count -gt 0) {
             [void](Write-RefreshStatusLine -Message 'Office 应用已退出' -Color Green -PreviousLength $closeStatusLineLength)
@@ -794,7 +794,7 @@ function Invoke-ConversionPlans {
     }
 
     if ($tempConversionResults.Count -gt 0) {
-        $moveSummary = Move-ConvertedOfficeFiles -TempConversionResults $tempConversionResults.ToArray()
+        $moveSummary = Move-ConvertedOfficeFileList -TempConversionResults $tempConversionResults.ToArray()
         $movedCount += $moveSummary.MovedCount
         $skippedCount += $moveSummary.SkippedCount
         $failedCount += $moveSummary.FailedCount
@@ -832,7 +832,7 @@ catch {
     exit 1
 }
 
-$conversionPlans = @(New-ConversionPlans -RootPath $resolvedPath)
+$conversionPlans = @(New-ConversionPlanList -RootPath $resolvedPath)
 if ($conversionPlans.Count -eq 0) {
     # 没有可处理文件时直接成功退出。
     Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
@@ -840,4 +840,4 @@ if ($conversionPlans.Count -eq 0) {
 }
 
 [void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
-Invoke-ConversionPlans -ConversionPlans $conversionPlans
+Invoke-ConversionPlanList -ConversionPlans $conversionPlans

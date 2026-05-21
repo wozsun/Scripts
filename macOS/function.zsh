@@ -33,17 +33,22 @@ hp() {
 可用函数列表：
 
 - ete [-t hour] file1 [file2 ...]
-  根据文件名（YYYYMMDD_HHMMSS）写入媒体时间标签（dng/heic/mov）。
+  根据文件名（YYYYMMDD_HHMMSS）写入媒体时间标签（heic/mov）
+
 - rtf file_or_directory1 [file_or_directory2 ...]
-  读取拍摄时间并重命名文件为 YYYYMMDD_HHMMSS[NN].ext。
-- etc file_or_directory1 [file_or_directory2 ...]
-  同时校验媒体时间标签与文件名时间一致性，不一致时使用文件名修改（dng/heic/mov）。
+  读取拍摄时间并重命名文件为 YYYYMMDD_HHMMSS[NN].ext
+
+- mtc file_or_directory1 [file_or_directory2 ...]
+  同时校验媒体时间标签与文件名时间一致性，不一致时调用 ete 修复（heic/mov）
+
 - ctw [-q 0-100] file_or_directory1 [file_or_directory2 ...]
-  将图片转换为 webp；默认自动压到 500KB 内，使用 -q 时不限制体积。
+  将图片转换为 webp；默认自动压到 500KB 内，使用 -q 时不限制体积
+
 - cmv directory
-  按文件名日期（YYYYMMDD）归类到对应子目录。
+  按文件名日期（YYYYMMDD）归类到对应子目录
+
 - fmv directory
-  将子目录图片/视频提取到根目录后，依次执行 rtf 与 cmv。
+  将子目录图片/视频提取到根目录后，依次执行 rtf、cmv 与 mtc
 
 查看详细帮助:
   函数名 -h
@@ -64,13 +69,13 @@ ete() {
 
 功能:
   根据文件名中的时间（YYYYMMDD_HHMMSS[NN]）写入媒体元数据时间标签。
-  支持 dng / heic / mov。
+  支持 heic / mov。
 
 参数:
   -t hour  写入时区，默认 8；例如 -t 8 表示 +08:00，-t -8 表示 -08:00。
 
 行为说明:
-  dng/heic:
+  heic:
     写入 CreateDate / ModifyDate / DateTimeOriginal，并写入 OffsetTime* 时区标签。
   mov:
     以 QuickTime UTC 语义写入 CreateDate / ModifyDate / CreationDate / Media* / Track*。
@@ -137,9 +142,12 @@ EOF
         return 1
     fi
 
+    local -i failed_count=0
+
     for file_path in "${input_files[@]}"; do
         if [[ ! -f "$file_path" ]]; then
             msg_error "文件 \"$file_path\" 不存在，跳过。"
+            ((failed_count++))
             continue
         fi
 
@@ -150,6 +158,7 @@ EOF
         # ete 允许文件名带 rtf 追加序号（如 YYYYMMDD_HHMMSS01），解析时仅取前 15 位时间主体
         if ! _media_is_timestamp_name "$file_base"; then
             msg_error "文件名 \"$file_name\" 不符合 YYYYMMDD_HHMMSS[NN]，跳过。"
+            ((failed_count++))
             continue
         fi
 
@@ -157,14 +166,13 @@ EOF
         local formatted_time=$(date -j -f "%Y%m%d_%H%M%S" "$base_time" +"%Y:%m:%d %H:%M:%S" 2>/dev/null)
         if [[ -z "$formatted_time" ]]; then
             msg_error "无法从文件名 \"$file_name\" 解析时间，跳过。"
+            ((failed_count++))
             continue
         fi
 
         case "$file_ext" in
-            dng|heic)
-                local label="HEIF"
-                [[ "$file_ext" == "dng" ]] && label="DNG"
-                msg_progress "检测到 ${label} 文件，正在修改对应时间标签..."
+            heic)
+                msg_progress "检测到 HEIC 文件，正在修改对应时间标签..."
                 if ! exiftool \
                     -CreateDate="$formatted_time" \
                     -ModifyDate="$formatted_time" \
@@ -175,6 +183,7 @@ EOF
                     -overwrite_original \
                     "$file_path"; then
                     msg_error "修改时间标签失败: \"$file_path\""
+                    ((failed_count++))
                     continue
                 fi
                 msg_info "修改结果如下："
@@ -202,6 +211,7 @@ EOF
                     -TrackModifyDate="$adjusted_time" \
                     "$file_path"; then
                     msg_error "修改时间标签失败: \"$file_path\""
+                    ((failed_count++))
                     continue
                 fi
                 msg_info "修改结果如下："
@@ -221,9 +231,12 @@ EOF
                 ;;
             *)
                 msg_error "不支持的文件类型 \"$file_ext\""
+                ((failed_count++))
                 ;;
         esac
     done
+
+    (( failed_count == 0 ))
 }
 
 # 函数: rtf
@@ -368,22 +381,22 @@ EOF
     (( failed_count == 0 ))
 }
 
-# 函数: etc
-etc() {
+# 函数: mtc
+mtc() {
     emulate -L zsh
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
 用法:
-  etc file_or_directory1 [file_or_directory2 ...]
+  mtc file_or_directory1 [file_or_directory2 ...]
 
 功能:
   校验媒体时间一致性，并校验文件名时间与元数据时间是否一致。
   不一致时（且文件名符合规范）调用 ete 修复。
 
 行为说明:
-  目录输入时递归扫描 dng/heic 与 mov。
-  dng/heic 校验: CreateDate / ModifyDate / DateTimeOriginal。
+  目录输入时递归扫描 heic 与 mov。
+  heic 校验: CreateDate / ModifyDate / DateTimeOriginal。
   mov 校验: CreateDate / ModifyDate / CreationDate / Media* / Track*（QuickTimeUTC=1）。
   文件名格式要求: YYYYMMDD_HHMMSS[NN]（NN 为 01-99）。
 EOF
@@ -391,7 +404,7 @@ EOF
     fi
 
     if [[ $# -lt 1 ]]; then
-        msg_error "用法: etc file_or_directory1 [file_or_directory2 ...]"
+        msg_error "用法: mtc file_or_directory1 [file_or_directory2 ...]"
         return 1
     fi
 
@@ -400,13 +413,16 @@ EOF
         return 1
     fi
 
+    local -i failed_count=0
+
     for file_path; do
-        local -a files_image=()
+        local -a files_heic=()
         local -a files_mov=()
 
         if [[ -d "$file_path" ]]; then
-            if ! _common_collect_directory_files "$file_path" recursive heic dng mov; then
+            if ! _common_collect_directory_files "$file_path" recursive heic mov; then
                 msg_error "扫描目录失败: \"$file_path\""
+                ((failed_count++))
                 continue
             fi
 
@@ -415,34 +431,35 @@ EOF
             for found_media in "${found_media_files[@]}"; do
                 if _common_path_has_extension "$found_media" mov; then
                     files_mov+=("$found_media")
-                elif _common_path_has_extension "$found_media" heic dng; then
-                    files_image+=("$found_media")
+                elif _common_path_has_extension "$found_media" heic; then
+                    files_heic+=("$found_media")
                 fi
             done
         elif [[ -f "$file_path" ]]; then
             # 如果是单文件，按扩展名分流，避免同一文件被图片/视频逻辑重复处理
             if _common_path_has_extension "$file_path" mov; then
                 files_mov=("$file_path")
-            elif _common_path_has_extension "$file_path" heic dng; then
-                files_image=("$file_path")
+            elif _common_path_has_extension "$file_path" heic; then
+                files_heic=("$file_path")
             else
-                msg_error "不支持的文件类型 \"$file_path\"，跳过。"
+                msg_info "跳过: mtc 仅校验 HEIC/MOV \"$file_path\""
                 continue
             fi
         else
             msg_error "\"$file_path\" 不是有效的文件或目录，跳过。"
+            ((failed_count++))
             continue
         fi
 
-        msg_progress "扫描结果: \"$file_path\" -> HEIC/DNG ${#files_image[@]} 个, MOV ${#files_mov[@]} 个"
+        msg_progress "扫描结果: \"$file_path\" -> HEIC ${#files_heic[@]} 个, MOV ${#files_mov[@]} 个"
 
-        for file_image in "${files_image[@]}"; do
+        for file_heic in "${files_heic[@]}"; do
             local -a time_values
             time_values=("${(@f)$(exiftool -m -f -fast -s3 \
                 -CreateDate \
                 -ModifyDate \
                 -DateTimeOriginal \
-                "$file_image")}")
+                "$file_heic")}")
 
             local create_date="${time_values[1]}"
             local modify_date="${time_values[2]}"
@@ -453,10 +470,12 @@ EOF
                 metadata_consistent=1
             fi
 
-            _etc_check_and_fix "$file_image" "图片" "$metadata_consistent" "$create_date" \
+            if ! _mtc_check_and_fix "$file_heic" "图片" "$metadata_consistent" "$create_date" \
                 "CreateDate: $create_date" \
                 "ModifyDate: $modify_date" \
-                "DateTimeOriginal: $original_date"
+                "DateTimeOriginal: $original_date"; then
+                ((failed_count++))
+            fi
         done
 
         for file_mov in "${files_mov[@]}"; do
@@ -489,16 +508,20 @@ EOF
                 metadata_consistent=1
             fi
 
-            _etc_check_and_fix "$file_mov" "视频" "$metadata_consistent" "$create_date" \
+            if ! _mtc_check_and_fix "$file_mov" "视频" "$metadata_consistent" "$create_date" \
                 "CreateDate: $create_date" \
                 "ModifyDate: $modify_date" \
                 "CreationDate: $creation_date" \
                 "MediaCreateDate: $media_create_date" \
                 "MediaModifyDate: $media_modify_date" \
                 "TrackCreateDate: $track_create_date" \
-                "TrackModifyDate: $track_modify_date"
+                "TrackModifyDate: $track_modify_date"; then
+                ((failed_count++))
+            fi
         done
     done
+
+    (( failed_count == 0 ))
 }
 
 # ========== 图片转换 ==========
@@ -778,6 +801,14 @@ EOF
         return 1
     fi
 
+    local normalized_target_dir="${target_dir:A}"
+    local target_leaf="${normalized_target_dir:t}"
+    local target_parent="${normalized_target_dir:h:t}"
+    if [[ "$target_parent" =~ '^[0-9]{4}$' && "$target_leaf" =~ '^[0-9]{4}$' ]]; then
+        msg_warn "跳过: \"$target_dir\" 看起来已经是 YYYY/MMDD 归类目录。请对根目录执行 cmv。"
+        return 0
+    fi
+
     local -i moved_count=0
     local -i skipped_count=0
 
@@ -842,13 +873,13 @@ fmv() {
   fmv directory
 
 功能:
-  将子目录中的指定媒体文件提取到根目录，再执行 rtf 与 cmv。
+  将子目录中的指定媒体文件提取到根目录，再执行 rtf、cmv 与 mtc。
 
 行为说明:
   仅提取以下扩展名: heic/jpg/jpeg/dng/cr3/mov/mp4。
   仅提取子目录层级文件（mindepth 2），不处理根目录已有文件。
   若根目录存在同名文件则跳过该文件。
-  提取后删除空子目录，再执行重命名与归类。
+  提取后删除空子目录，再执行重命名、归类与时间校验。
 EOF
         return 0
     fi
@@ -916,6 +947,12 @@ EOF
         msg_warn "cmv 执行失败，请检查根目录中的已移动文件。"
         return 1
     fi
+
+    msg_progress "开始执行 mtc 时间校验..."
+    if ! mtc "$target_dir"; then
+        msg_warn "mtc 执行失败，请检查已归类文件。"
+        return 1
+    fi
 }
 
 # ========== 媒体内部工具函数 ==========
@@ -937,7 +974,7 @@ _media_timestamp_body() {
 
 # 内部辅助函数：校验文件名与元数据一致性，并在需要时自动修复。
 # 参数: file_path label metadata_consistent create_date "field: value" ...
-_etc_check_and_fix() {
+_mtc_check_and_fix() {
     emulate -L zsh
 
     local file_path="$1"

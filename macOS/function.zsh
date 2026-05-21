@@ -2,7 +2,7 @@
 
 # 自动加载同目录公共工具函数；外部只需要 source 当前文件。
 _load_common_functions() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     # %x 指向当前被 source 的文件，比 %N 更适合在函数内定位脚本路径。
     local script_path="${${(%):-%x}:A}"
@@ -26,7 +26,7 @@ unfunction _load_common_functions 2>/dev/null
 # ========== 帮助总览 ==========
 
 hp() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     cat <<'EOF'
 
@@ -60,7 +60,7 @@ EOF
 
 # 函数: ete
 ete() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -241,7 +241,7 @@ EOF
 
 # 函数: rtf
 rtf() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -260,8 +260,6 @@ rtf() {
 EOF
         return 0
     fi
-
-    local -i max_suffix=99  # 同一秒最大冲突序号（01-99）
 
     if [[ $# -lt 1 ]]; then
         msg_error "用法: rtf file_or_directory1 [file_or_directory2 ...]"
@@ -339,37 +337,17 @@ EOF
         local base_name="$formatted_time"
         local current_name_part="${file_path:t:r}"
         local new_file_name=""
-        local -i counter=0
 
         if _media_is_timestamp_name "$current_name_part" && [[ "$(_media_timestamp_body "$current_name_part")" == "$formatted_time" ]]; then
             msg_info "跳过: \"$file_path\" 已符合目标命名。"
             continue
         fi
 
-        # 循环生成唯一文件名
-        while :; do
-            if [[ $counter == 0 ]]; then
-                new_file_name="${dir_path}/${base_name}.${file_ext}"
-            else
-                local suffix=$(printf "%02d" "$counter")
-                new_file_name="${dir_path}/${base_name}${suffix}.${file_ext}"
-            fi
-
-            if [[ ! -e "$new_file_name" ]]; then
-                break
-            fi
-
-            if (( counter >= max_suffix )); then
-                msg_error "\"$file_path\" 的时间冲突超过 ${max_suffix} 次，跳过。"
-                ((failed_count++))
-                new_file_name=""
-                break
-            fi
-
-            ((counter++))
-        done
-
-        [[ -z "$new_file_name" ]] && continue
+        if ! new_file_name="$(_common_next_available_file_path "$dir_path" "$base_name" "$file_ext")"; then
+            msg_error "\"$file_path\" 的时间冲突超过 99 次，跳过。"
+            ((failed_count++))
+            continue
+        fi
 
         if _common_move_file_no_clobber "$file_path" "$new_file_name"; then
             msg_success "文件 \"$file_path\" 已重命名为 \"$new_file_name\""
@@ -383,7 +361,7 @@ EOF
 
 # 函数: mtc
 mtc() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -528,7 +506,7 @@ EOF
 
 # 函数: ctw
 ctw() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -772,7 +750,7 @@ EOF
 
 # 函数: cmv
 cmv() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -865,7 +843,7 @@ EOF
 
 # 函数: fmv
 fmv() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     if [[ "${1:-}" == "-h" ]]; then
         cat <<'EOF'
@@ -878,7 +856,7 @@ fmv() {
 行为说明:
   仅提取以下扩展名: heic/jpg/jpeg/dng/cr3/mov/mp4。
   仅提取子目录层级文件（mindepth 2），不处理根目录已有文件。
-  若根目录存在同名文件则跳过该文件。
+  若根目录存在同名文件，则自动追加两位序号后提取。
   提取后删除空子目录，再执行重命名、归类与时间校验。
 EOF
         return 0
@@ -911,11 +889,10 @@ EOF
 
     local -a source_files=("${reply[@]}")
     for src_file in "${source_files[@]}"; do
-        local base_name="${src_file:t}"
-        local dest_file="$target_dir/$base_name"
-
-        if [[ -e "$dest_file" ]]; then
-            msg_warn "跳过: 目标已存在 \"$dest_file\""
+        local dest_file
+        local file_name="${src_file:t}"
+        if ! dest_file="$(_common_next_available_file_path "$target_dir" "${file_name:r}" "${file_name:e}")"; then
+            msg_error "无法为 \"$src_file\" 生成唯一目标文件名，跳过。"
             continue
         fi
 
@@ -959,7 +936,7 @@ EOF
 
 # 判断文件名主体是否符合 YYYYMMDD_HHMMSS[NN]。
 _media_is_timestamp_name() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local name_part="$1"
     [[ "$name_part" =~ '^[0-9]{8}_[0-9]{6}((0[1-9])|([1-9][0-9]))?$' ]]
@@ -967,7 +944,7 @@ _media_is_timestamp_name() {
 
 # 从标准时间文件名主体中取出 YYYYMMDD_HHMMSS。
 _media_timestamp_body() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     print -r -- "${1:0:15}"
 }
@@ -975,7 +952,7 @@ _media_timestamp_body() {
 # 内部辅助函数：校验文件名与元数据一致性，并在需要时自动修复。
 # 参数: file_path label metadata_consistent create_date "field: value" ...
 _mtc_check_and_fix() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local file_path="$1"
     local label="$2"

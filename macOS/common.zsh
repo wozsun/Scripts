@@ -6,7 +6,7 @@
 
 # 判断当前输出目标是否适合使用颜色。
 _common_should_color() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     [[ -n "${NO_COLOR:-}" ]] && return 1
     [[ "${TERM:-dumb}" == "dumb" ]] && return 1
@@ -15,7 +15,7 @@ _common_should_color() {
 
 # 输出带颜色的标签；正文使用普通 print，避免文件名中的 % 被 prompt expansion 误解析。
 msg_label() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local color_name="$1"
     local label_text="$2"
@@ -31,35 +31,35 @@ msg_label() {
 
 # 错误信息写入 stderr。
 msg_error() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     msg_label red "错误" "$@" >&2
 }
 
 # 警告信息写入 stderr。
 msg_warn() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     msg_label yellow "警告" "$@" >&2
 }
 
 # 普通提示信息写入 stdout。
 msg_info() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     msg_label blue "信息" "$@"
 }
 
 # 阶段进度信息写入 stdout。
 msg_progress() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     msg_label cyan "进度" "$@"
 }
 
 # 成功结果写入 stdout。
 msg_success() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     msg_label green "完成" "$@"
 }
@@ -69,7 +69,7 @@ msg_success() {
 # 收集 find -print0 结果到 reply。
 # 使用临时文件承接 find 输出，避免管道 while 的子 shell 问题，同时保留 find 的退出状态。
 _common_collect_find_results() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     reply=()
     local temp_file=""
@@ -100,7 +100,7 @@ _common_collect_find_results() {
 
 # 将扩展名列表转换为 find 可用的 -iname 条件，结果写入 reply。
 _common_build_extension_find_args() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     reply=()
     local extension
@@ -114,7 +114,7 @@ _common_build_extension_find_args() {
 
 # 判断路径扩展名是否在允许列表中；未传允许列表时表示不限制扩展名。
 _common_path_has_extension() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local file_path="$1"
     shift
@@ -134,7 +134,7 @@ _common_path_has_extension() {
 
 # 对路径列表按字典序排序并去重，结果写入 reply。
 _common_sort_unique_paths() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local -a input_paths=("$@")
     reply=("${(@uon)input_paths}")
@@ -146,7 +146,7 @@ _common_sort_unique_paths() {
 # - recursive: 当前目录及所有子目录文件。
 # - children: 仅子目录层级文件，不包含根目录当前层文件。
 _common_collect_directory_files() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local directory_path="$1"
     local scan_scope="$2"
@@ -189,7 +189,7 @@ _common_collect_directory_files() {
 # 从输入参数收集文件，结果写入 reply。
 # 文件参数会直接校验扩展名；目录参数会按 scan_scope 扫描后再过滤。
 _common_collect_input_files() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local scan_scope="$1"
     local unsupported_kind="$2"
@@ -236,21 +236,53 @@ _common_collect_input_files() {
 
 # 检查外部命令是否可用。
 _common_command_exists() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     command -v "$1" >/dev/null 2>&1
 }
 
 # 获取文件扩展名并转为小写；无扩展名时返回空字符串。
 _common_path_lower_extension() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     print -r -- "${1:t:e:l}"
 }
 
+# 生成不冲突文件路径，冲突时在扩展名前追加 01-99。
+_common_next_available_file_path() {
+    emulate -L zsh -o typeset_silent
+
+    local directory_path="$1"
+    local base_name="$2"
+    local file_ext="$3"
+
+    local candidate_path="$directory_path/$base_name"
+    [[ -n "$file_ext" ]] && candidate_path="${candidate_path}.${file_ext}"
+
+    if [[ ! -e "$candidate_path" ]]; then
+        print -r -- "$candidate_path"
+        return 0
+    fi
+
+    local -i counter
+    local suffix
+    for (( counter = 1; counter <= 99; counter++ )); do
+        suffix=$(printf "%02d" "$counter")
+        candidate_path="$directory_path/${base_name}${suffix}"
+        [[ -n "$file_ext" ]] && candidate_path="${candidate_path}.${file_ext}"
+
+        if [[ ! -e "$candidate_path" ]]; then
+            print -r -- "$candidate_path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # 执行文件移动/替换，并统一输出失败原因。
 _common_move_file() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local source_path="$1"
     local target_path="$2"
@@ -265,7 +297,7 @@ _common_move_file() {
 
 # 执行不覆盖目标的文件移动；用于原始媒体文件整理，避免竞态覆盖已有文件。
 _common_move_file_no_clobber() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local source_path="$1"
     local target_path="$2"
@@ -290,7 +322,7 @@ _common_move_file_no_clobber() {
 
 # 清理临时文件；失败时只给出警告，不中断主流程。
 _common_remove_temp_file() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local temp_path="$1"
 
@@ -306,7 +338,7 @@ _common_remove_temp_file() {
 
 # 清理临时目录；仅用于 mktemp -d 创建的脚本临时目录。
 _common_remove_temp_directory() {
-    emulate -L zsh
+    emulate -L zsh -o typeset_silent
 
     local temp_dir="$1"
 

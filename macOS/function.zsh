@@ -269,6 +269,8 @@ EOF
         return 1
     fi
 
+    local -i failed_count=0
+
     for file_path in "${sorted_target_files[@]}"; do
 
         local file_name="${file_path:t}"
@@ -305,6 +307,7 @@ EOF
 
         if [[ -z "$original_time" ]]; then
             msg_error "无法读取 \"$file_path\" 的拍摄时间，跳过。"
+            ((failed_count++))
             continue
         fi
 
@@ -315,6 +318,7 @@ EOF
         local formatted_time=$(date -j -f "%Y:%m:%d %H:%M:%S" "$name_time" +"%Y%m%d_%H%M%S" 2>/dev/null)
         if [[ -z "$formatted_time" ]]; then
             msg_error "时间格式转换失败，跳过 \"$file_path\"。"
+            ((failed_count++))
             continue
         fi
 
@@ -344,6 +348,7 @@ EOF
 
             if (( counter >= max_suffix )); then
                 msg_error "\"$file_path\" 的时间冲突超过 ${max_suffix} 次，跳过。"
+                ((failed_count++))
                 new_file_name=""
                 break
             fi
@@ -353,10 +358,14 @@ EOF
 
         [[ -z "$new_file_name" ]] && continue
 
-        if _common_move_file "$file_path" "$new_file_name"; then
+        if _common_move_file_no_clobber "$file_path" "$new_file_name"; then
             msg_success "文件 \"$file_path\" 已重命名为 \"$new_file_name\""
+        else
+            ((failed_count++))
         fi
     done
+
+    (( failed_count == 0 ))
 }
 
 # 函数: etc
@@ -568,9 +577,12 @@ EOF
         return 1
     fi
 
+    local -i failed_count=0
+
     for input in "${sorted_target_files[@]}"; do
         if [[ ! -f "$input" ]]; then
             msg_error "文件不存在 \"$input\""
+            ((failed_count++))
             continue
         fi
 
@@ -586,6 +598,7 @@ EOF
         local tmp_dir=""
         if ! tmp_dir=$(command mktemp -d "$dir/.ctw_tmp.XXXXXX"); then
             msg_error "创建临时目录失败，跳过 \"$input_display\""
+            ((failed_count++))
             continue
         fi
 
@@ -652,19 +665,22 @@ EOF
                     msg_error "尺寸缩放失败 \"$input_display\""
                     _common_remove_temp_file "$tmp_resized" >/dev/null
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    ((failed_count++))
                     continue
                 fi
             fi
         else
             msg_error "无法读取图片尺寸，跳过 \"$input_display\""
             _common_remove_temp_file "$tmp_output" >/dev/null
+            ((failed_count++))
             continue
         fi
 
-        while (( try_quality >= min_quality )); do
+        while (( enforce_size_limit == 0 || try_quality >= min_quality )); do
             if ! cwebp -quiet -q "$try_quality" "$source_for_convert" -o "$tmp_output"; then
                 msg_error "转换失败 \"$input_display\""
                 _common_remove_temp_file "$tmp_output" >/dev/null
+                ((failed_count++))
                 break
             fi
 
@@ -679,6 +695,7 @@ EOF
                     fi
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    ((failed_count++))
                 fi
                 break
             fi
@@ -689,6 +706,7 @@ EOF
                     msg_success "完成: \"$input_display\" -> \"$output_display\" (q=$try_quality, size=$((final_size/1024))KB${resize_note}${overwrite_note})"
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    ((failed_count++))
                 fi
                 break
             fi
@@ -703,6 +721,7 @@ EOF
         if (( converted == 0 )); then
             if [[ -f "$tmp_output" ]]; then
                 if _common_move_file "$tmp_output" "$output"; then
+                    converted=1
                     final_size=$(stat -f%z "$output" 2>/dev/null)
                     if [[ -n "$final_size" ]]; then
                         msg_warn "\"$input_display\" 在 q=${min_quality} 时仍大于 ${max_size_kb}KB，已输出 \"$output_display\" (size=$((final_size/1024))KB${resize_note}${overwrite_note})"
@@ -711,7 +730,10 @@ EOF
                     fi
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    ((failed_count++))
                 fi
+            else
+                ((failed_count++))
             fi
         fi
 
@@ -719,6 +741,8 @@ EOF
             _common_remove_temp_directory "$tmp_dir" >/dev/null
         }
     done
+
+    (( failed_count == 0 ))
 }
 
 # ========== 文件归类 ==========
@@ -783,7 +807,7 @@ EOF
         local md_part="${date_prefix:4:4}"
 
         local date_dir="$target_dir/$year_part/$md_part"
-        if ! command mkdir -p "$date_dir"; then
+        if ! command mkdir -p -- "$date_dir"; then
             msg_error "创建目录失败: \"$date_dir\""
             ((skipped_count++))
             continue
@@ -797,7 +821,7 @@ EOF
             continue
         fi
 
-        if _common_move_file "$file_path" "$dest_file"; then
+        if _common_move_file_no_clobber "$file_path" "$dest_file"; then
             ((moved_count++))
             msg_success "已归类: \"$file_name\" -> \"$year_part/$md_part/$file_name\""
         else
@@ -842,6 +866,11 @@ EOF
         return 1
     fi
 
+    if ! _common_command_exists exiftool; then
+        msg_error "未检测到 exiftool。请先执行: brew install exiftool"
+        return 1
+    fi
+
     local -a moved_files=()
 
     if ! _common_collect_directory_files "$target_dir" children "${media_extensions[@]}"; then
@@ -860,13 +889,13 @@ EOF
         fi
 
         # 记录移动后的根目录路径，供后续 rtf 精确处理这些文件。
-        if _common_move_file "$src_file" "$dest_file"; then
+        if _common_move_file_no_clobber "$src_file" "$dest_file"; then
             moved_files+=("$dest_file")
             msg_success "已移动: \"$src_file\" -> \"$dest_file\""
         fi
     done
 
-    # 只清理被提取后变空的子目录，不删除目标根目录。
+    # 删除空子目录（不删除目标目录本身）。
     if ! command find "$target_dir" -mindepth 1 -type d -empty -delete; then
         msg_warn "清理空子目录失败: \"$target_dir\""
     fi
@@ -877,10 +906,16 @@ EOF
     fi
 
     msg_progress "开始执行 rtf 重命名..."
-    rtf "${moved_files[@]}"
+    if ! rtf "${moved_files[@]}"; then
+        msg_warn "rtf 执行失败，已停止后续归类；已移动文件保留在根目录。"
+        return 1
+    fi
 
     msg_progress "开始执行 cmv 自动归类..."
-    cmv "$target_dir"
+    if ! cmv "$target_dir"; then
+        msg_warn "cmv 执行失败，请检查根目录中的已移动文件。"
+        return 1
+    fi
 }
 
 # ========== 媒体内部工具函数 ==========

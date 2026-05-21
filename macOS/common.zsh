@@ -4,6 +4,15 @@
 
 # ========== 彩色输出 ==========
 
+# 判断当前输出目标是否适合使用颜色。
+_common_should_color() {
+    emulate -L zsh
+
+    [[ -n "${NO_COLOR:-}" ]] && return 1
+    [[ "${TERM:-dumb}" == "dumb" ]] && return 1
+    [[ -t 1 || ( -n "${CLICOLOR_FORCE:-}" && "${CLICOLOR_FORCE}" != "0" ) ]]
+}
+
 # 输出带颜色的标签；正文使用普通 print，避免文件名中的 % 被 prompt expansion 误解析。
 msg_label() {
     emulate -L zsh
@@ -12,7 +21,11 @@ msg_label() {
     local label_text="$2"
     shift 2
 
-    print -Pn "%F{${color_name}}${label_text}:%f "
+    if _common_should_color; then
+        print -Pn "%B%F{${color_name}}${label_text}:%f%b "
+    else
+        print -rn -- "${label_text}: "
+    fi
     print -r -- "$*"
 }
 
@@ -34,7 +47,7 @@ msg_warn() {
 msg_info() {
     emulate -L zsh
 
-    msg_label white "信息" "$@"
+    msg_label blue "信息" "$@"
 }
 
 # 阶段进度信息写入 stdout。
@@ -77,7 +90,7 @@ _common_collect_find_results() {
             find_status=1
         fi
     } always {
-        if [[ -n "$temp_file" && -e "$temp_file" ]] && ! command rm -f "$temp_file"; then
+        if [[ -n "$temp_file" && -e "$temp_file" ]] && ! command rm -f -- "$temp_file"; then
             msg_warn "临时文件清理失败: \"$temp_file\""
         fi
     }
@@ -235,19 +248,44 @@ _common_path_lower_extension() {
     print -r -- "${1:t:e:l}"
 }
 
-# 执行文件移动，并统一输出失败原因。
+# 执行文件移动/替换，并统一输出失败原因。
 _common_move_file() {
     emulate -L zsh
 
     local source_path="$1"
     local target_path="$2"
 
-    if command mv "$source_path" "$target_path"; then
+    if command mv -- "$source_path" "$target_path"; then
         return 0
     fi
 
     msg_error "移动失败: \"$source_path\" -> \"$target_path\""
     return 1
+}
+
+# 执行不覆盖目标的文件移动；用于原始媒体文件整理，避免竞态覆盖已有文件。
+_common_move_file_no_clobber() {
+    emulate -L zsh
+
+    local source_path="$1"
+    local target_path="$2"
+
+    if [[ -e "$target_path" ]]; then
+        msg_warn "跳过移动: 目标已存在 \"$target_path\""
+        return 1
+    fi
+
+    if ! command mv -n -- "$source_path" "$target_path"; then
+        msg_error "移动失败: \"$source_path\" -> \"$target_path\""
+        return 1
+    fi
+
+    if [[ -e "$source_path" ]]; then
+        msg_warn "跳过移动: 目标已存在 \"$target_path\""
+        return 1
+    fi
+
+    return 0
 }
 
 # 清理临时文件；失败时只给出警告，不中断主流程。
@@ -258,7 +296,7 @@ _common_remove_temp_file() {
 
     [[ -z "$temp_path" || ! -e "$temp_path" ]] && return 0
 
-    if ! command rm -f "$temp_path"; then
+    if ! command rm -f -- "$temp_path"; then
         msg_warn "临时文件清理失败: \"$temp_path\""
         return 1
     fi
@@ -274,7 +312,7 @@ _common_remove_temp_directory() {
 
     [[ -z "$temp_dir" || ! -d "$temp_dir" ]] && return 0
 
-    if ! command rm -rf "$temp_dir"; then
+    if ! command rm -rf -- "$temp_dir"; then
         msg_warn "临时目录清理失败: \"$temp_dir\""
         return 1
     fi

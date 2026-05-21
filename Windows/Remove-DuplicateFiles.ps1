@@ -277,6 +277,66 @@ function Complete-ProgressBar {
     Write-Host ""
 }
 
+# 新建延迟输出的扫描警告列表，避免进度条刷新时被错误信息打断。
+function New-DeferredScanWarningList {
+    $warningList = [System.Collections.Generic.List[object]]::new()
+    return , $warningList
+}
+
+# 记录扫描或哈希阶段的可跳过错误；未传入列表时退化为立即输出。
+function Add-DeferredScanWarning {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[object]]$WarningList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Reason
+    )
+
+    if ($null -eq $WarningList) {
+        Write-Host "$($Message): $Path" -ForegroundColor Yellow
+        Write-Host "  原因: $Reason" -ForegroundColor DarkGray
+        return
+    }
+
+    $WarningList.Add([pscustomobject]@{
+            Message = $Message
+            Path    = $Path
+            Reason  = $Reason
+        })
+}
+
+# 在当前进度段结束后统一输出扫描警告，保持动态进度条单行刷新。
+function Write-DeferredScanWarningList {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[object]]$WarningList,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Title = '扫描跳过汇总'
+    )
+
+    if ($null -eq $WarningList -or $WarningList.Count -eq 0) {
+        return
+    }
+
+    Write-Host "$($Title): $($WarningList.Count)" -ForegroundColor Yellow
+    foreach ($warning in $WarningList) {
+        Write-Host "$($warning.Message): $($warning.Path)" -ForegroundColor Yellow
+        Write-Host "  原因: $($warning.Reason)" -ForegroundColor DarkGray
+    }
+}
+
 # 输出用于区分不同预览或结果块的分隔线。
 function Write-PreviewSeparator {
     Write-Host ""
@@ -764,7 +824,10 @@ function Get-ScannedFileList {
         [string]$ProgressLabel = '目录',
 
         [Parameter(Mandatory = $false)]
-        [switch]$SuppressScanStageMessages
+        [switch]$SuppressScanStageMessages,
+
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[object]]$WarningList
     )
 
     if (-not $SuppressScanStageMessages) {
@@ -780,13 +843,18 @@ function Get-ScannedFileList {
     }
 
     $scanErrors = @($scanErrorList)
-    if ($SuppressScanStageMessages -and $scanErrors.Count -gt 0) {
-        Complete-ProgressBar
-    }
+    if ($scanErrors.Count -gt 0) {
+        $scanWarningList = if ($null -ne $WarningList) { $WarningList } else { New-DeferredScanWarningList }
+        foreach ($scanError in $scanErrors) {
+            Add-DeferredScanWarning -WarningList $scanWarningList -Message '扫描跳过' -Path $scanError.TargetObject -Reason $scanError.Exception.Message
+        }
 
-    foreach ($scanError in $scanErrors) {
-        Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
-        Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
+        if ($null -eq $WarningList) {
+            if ($SuppressScanStageMessages) {
+                Complete-ProgressBar
+            }
+            Write-DeferredScanWarningList -WarningList $scanWarningList -Title "$($ProgressLabel)扫描跳过汇总"
+        }
     }
 
     $hiddenScopeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
@@ -980,6 +1048,7 @@ function Find-DuplicateFileGroup {
     $processedPartialHashCount = 0
     $lastPartialHashPercent = -1
     $hashProgressName = "$($ProgressLabel)哈希计算"
+    $hashWarningList = New-DeferredScanWarningList
 
     foreach ($sizeGroup in $sameLengthGroups) {
         $partialHashRecords = @(
@@ -994,8 +1063,7 @@ function Find-DuplicateFileGroup {
                     }
                 }
                 catch {
-                    Write-Host "跳过文件，无法计算部分哈希: $($file.FullName)" -ForegroundColor Yellow
-                    Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+                    Add-DeferredScanWarning -WarningList $hashWarningList -Message '跳过文件，无法计算部分哈希' -Path $file.FullName -Reason $_.Exception.Message
                 }
             }
         )
@@ -1015,8 +1083,7 @@ function Find-DuplicateFileGroup {
                         }
                     }
                     catch {
-                        Write-Host "跳过文件，无法计算完整哈希: $($partialHashRecord.File.FullName)" -ForegroundColor Yellow
-                        Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+                        Add-DeferredScanWarning -WarningList $hashWarningList -Message '跳过文件，无法计算完整哈希' -Path $partialHashRecord.File.FullName -Reason $_.Exception.Message
                     }
                 }
             )
@@ -1035,6 +1102,7 @@ function Find-DuplicateFileGroup {
     }
 
     Complete-ProgressBar
+    Write-DeferredScanWarningList -WarningList $hashWarningList -Title "$($ProgressLabel)哈希跳过汇总"
 }
 
 # 输出默认预览中的单个重复文件块。
@@ -1349,7 +1417,15 @@ function Read-MenuChoice {
 
     $validMenuChoices = @($MenuOptionList | ForEach-Object { $_.Value })
     while ($true) {
-        $menuChoice = (Read-Host "请输入选项").Trim()
+        $inputRaw = Read-Host "请输入选项"
+
+        if ($null -eq $inputRaw) {
+            Write-Host "输入流已结束，程序退出。" -ForegroundColor Yellow
+            return "00"
+        }
+
+        $menuChoice = $inputRaw.Trim()
+
         if ($validMenuChoices -contains $menuChoice) {
             return $menuChoice
         }
@@ -1458,6 +1534,7 @@ function New-MergedDirectoryDeletionPlan {
     $mergedScanFileCount = 0
     $lastMergedScanPercent = -1
     $hiddenScopeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
+    $mergedScanWarningList = New-DeferredScanWarningList
 
     Write-StageMessage "开始扫描合并目录，目录数: $($RootPathList.Count)"
     for ($rootIndex = 0; $rootIndex -lt $RootPathList.Count; $rootIndex++) {
@@ -1467,7 +1544,7 @@ function New-MergedDirectoryDeletionPlan {
         $pathPrefix = "{0}-{1}" -f $rootNumber, $rootLabel
 
         Write-ProgressBar -Activity '合并目录扫描' -Status "正在扫描目录 $rootNumber：$rootLabel" -ProcessedCount $rootIndex -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
-        $scannedFiles = @(Get-ScannedFileList -RootPath $rootPath -ProgressLabel "合并目录$rootNumber" -SuppressScanStageMessages)
+        $scannedFiles = @(Get-ScannedFileList -RootPath $rootPath -ProgressLabel "合并目录$rootNumber" -SuppressScanStageMessages -WarningList $mergedScanWarningList)
         $mergedScanFileCount += $scannedFiles.Count
 
         foreach ($file in $scannedFiles) {
@@ -1479,6 +1556,7 @@ function New-MergedDirectoryDeletionPlan {
     }
     Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
     Complete-ProgressBar
+    Write-DeferredScanWarningList -WarningList $mergedScanWarningList -Title '合并目录扫描跳过汇总'
     Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
 
     $scannedFileList = @($fileRecordList | ForEach-Object { $_.File })
@@ -1881,7 +1959,10 @@ function Get-ReferencePartialHashIndex {
         [object]$ReferenceIndex,
 
         [Parameter(Mandatory = $true)]
-        [long]$Length
+        [long]$Length,
+
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[object]]$WarningList
     )
 
     if ($ReferenceIndex.PartialHashIndexByLength.ContainsKey($Length)) {
@@ -1902,8 +1983,7 @@ function Get-ReferencePartialHashIndex {
             $partialHashIndex[$partialHash].Add($referenceFile)
         }
         catch {
-            Write-Host "跳过参考文件，无法计算部分哈希: $($referenceFile.FullName)" -ForegroundColor Yellow
-            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Add-DeferredScanWarning -WarningList $WarningList -Message '跳过参考文件，无法计算部分哈希' -Path $referenceFile.FullName -Reason $_.Exception.Message
         }
     }
 
@@ -1921,7 +2001,10 @@ function Get-ReferenceFullHashIndex {
         [long]$Length,
 
         [Parameter(Mandatory = $true)]
-        [string]$PartialHash
+        [string]$PartialHash,
+
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[object]]$WarningList
     )
 
     if (-not $ReferenceIndex.FullHashIndexCache.ContainsKey($Length)) {
@@ -1933,7 +2016,7 @@ function Get-ReferenceFullHashIndex {
         return $fullHashCacheByPartialHash[$PartialHash]
     }
 
-    $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $Length
+    $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $Length -WarningList $WarningList
     $fullHashIndex = @{}
     if (-not $partialHashIndex.ContainsKey($PartialHash)) {
         $fullHashCacheByPartialHash[$PartialHash] = $fullHashIndex
@@ -1948,8 +2031,7 @@ function Get-ReferenceFullHashIndex {
             $fullHashIndex[$fullHash].Add($referenceFile)
         }
         catch {
-            Write-Host "跳过参考文件，无法计算完整哈希: $($referenceFile.FullName)" -ForegroundColor Yellow
-            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Add-DeferredScanWarning -WarningList $WarningList -Message '跳过参考文件，无法计算完整哈希' -Path $referenceFile.FullName -Reason $_.Exception.Message
         }
     }
 
@@ -1982,6 +2064,7 @@ function New-ReferenceDirectoryDeletionPlan {
     $matchedTargetFilesByHash = @{}
     $processedTargetFileCount = 0
     $lastTargetMatchPercent = -1
+    $matchWarningList = New-DeferredScanWarningList
     foreach ($file in $targetFileList) {
         $processedTargetFileCount++
         Write-ProgressBar -Activity '目标目录重复文件筛选' -Status '正在匹配参考目录索引' -ProcessedCount $processedTargetFileCount -TotalCount $targetFileList.Count -LastPercent ([ref]$lastTargetMatchPercent)
@@ -1995,17 +2078,16 @@ function New-ReferenceDirectoryDeletionPlan {
             $partialHash = Get-PartialContentHash -File $file
         }
         catch {
-            Write-Host "跳过文件，无法计算部分哈希: $($file.FullName)" -ForegroundColor Yellow
-            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Add-DeferredScanWarning -WarningList $matchWarningList -Message '跳过文件，无法计算部分哈希' -Path $file.FullName -Reason $_.Exception.Message
             continue
         }
 
-        $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length
+        $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -WarningList $matchWarningList
         if (-not $partialHashIndex.ContainsKey($partialHash)) {
             continue
         }
 
-        $fullHashIndex = Get-ReferenceFullHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -PartialHash $partialHash
+        $fullHashIndex = Get-ReferenceFullHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -PartialHash $partialHash -WarningList $matchWarningList
         if ($fullHashIndex.Count -eq 0) {
             continue
         }
@@ -2014,8 +2096,7 @@ function New-ReferenceDirectoryDeletionPlan {
             $fullHash = Get-FullContentHash -File $file
         }
         catch {
-            Write-Host "跳过文件，无法计算完整哈希: $($file.FullName)" -ForegroundColor Yellow
-            Write-Host "  原因: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Add-DeferredScanWarning -WarningList $matchWarningList -Message '跳过文件，无法计算完整哈希' -Path $file.FullName -Reason $_.Exception.Message
             continue
         }
 
@@ -2035,6 +2116,7 @@ function New-ReferenceDirectoryDeletionPlan {
     }
 
     Complete-ProgressBar
+    Write-DeferredScanWarningList -WarningList $matchWarningList -Title '参考匹配跳过汇总'
 
     $matchedTargetFileCount = 0
     foreach ($matchRecord in $matchedTargetFilesByHash.Values) {

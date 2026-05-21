@@ -36,11 +36,11 @@ $FileMoveDelayMilliseconds = 200
 # 进度条宽度，统一使用 # 和 -，便于在 Windows/macOS 终端中保持可读。
 $ProgressBarCellCount = 32
 
-# 脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
-$TempRootDirectoryName = '.convert-officefiles-tmp'
+# 单行刷新时尾部额外清理空格数，避免较长旧内容残留在行尾。
+$ConsoleLineClearPadding = 20
 
-# 本次运行的临时目录标识，同一轮转换共用，便于判断目录归属和安全清理。
-$TempRunId = [guid]::NewGuid().ToString('N')
+# 输入根目录下的脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
+$TempRootDirectoryName = '.convert-officefiles-tmp'
 
 # 旧格式扩展名到 Office 应用、新格式扩展名和保存格式编号的映射。
 # FileFormat 编号来自 Office COM 接口：Word 16=docx，Excel 51=xlsx，PowerPoint 24=pptx。
@@ -92,7 +92,8 @@ function Show-HelpText {
   默认保留原始 .doc、.xls、.ppt 文件。
   如果目标 .docx、.xlsx、.pptx 已存在，则跳过，不覆盖。
   脚本扫描后直接转换，不需要预览确认。
-  脚本会先转换到专属临时子文件夹，退出 Office 后再统一移动到目标位置。
+  扫描前会检查输入目录下的专属临时文件夹；如已有内容，会等待用户清理。
+  脚本会先转换到输入目录下的专属临时文件夹，退出 Office 后再统一移动到目标位置。
   每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 '@
 }
@@ -140,7 +141,7 @@ function Write-ProgressBar {
     $bar = ('#' * $filledWidth) + ('-' * $emptyWidth)
     $progressText = "[进度] $Activity [$bar] $percent% $Status ($ProcessedCount / $TotalCount)"
 
-    Write-Host -NoNewline "`r$progressText$(' ' * 20)" -ForegroundColor Cyan
+    Write-Host -NoNewline "`r$progressText$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Cyan
     $LastPercent.Value = $percent
 }
 
@@ -292,6 +293,15 @@ function Get-LegacyOfficeFileList {
         $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
     }
 
+    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
+    $separatorCharacters = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $tempRootPrefix = $tempRootDirectory.TrimEnd($separatorCharacters) + [System.IO.Path]::DirectorySeparatorChar
+    $files = @(
+        $files | Where-Object {
+            -not $_.FullName.StartsWith($tempRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    )
+
     foreach ($scanError in @($scanErrors)) {
         Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
         Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
@@ -329,14 +339,14 @@ function New-ConversionPlanList {
         $status = if (Test-Path -LiteralPath $targetPath) { 'SkipExists' } else { 'Convert' }
 
         $plans.Add([pscustomobject]@{
-            AppName        = $format.AppName
-            SourceFile     = $file
-            SourcePathText = Get-RelativePathText -RootPath $RootPath -FilePath $file.FullName
-            TargetPath     = $targetPath
-            TargetPathText = Get-RelativePathText -RootPath $RootPath -FilePath $targetPath
-            FileFormat     = $format.FileFormat
-            Status         = $status
-        })
+                AppName        = $format.AppName
+                SourceFile     = $file
+                SourcePathText = Get-RelativePathText -RootPath $RootPath -FilePath $file.FullName
+                TargetPath     = $targetPath
+                TargetPathText = Get-RelativePathText -RootPath $RootPath -FilePath $targetPath
+                FileFormat     = $format.FileFormat
+                Status         = $status
+            })
     }
 
     Complete-ProgressBar
@@ -359,51 +369,143 @@ function Write-ConversionPlanSummary {
     return $convertPlans.Count
 }
 
-# 获取目标文件所在目录下的脚本专属临时根目录。
+# 获取输入根目录下的脚本专属临时目录。
 function Get-TempRootDirectory {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TargetPath
+        [string]$RootPath
     )
 
-    $directory = [System.IO.Path]::GetDirectoryName($TargetPath)
-    return [System.IO.Path]::Combine($directory, $TempRootDirectoryName)
+    return [System.IO.Path]::Combine($RootPath, $TempRootDirectoryName)
 }
 
-# 创建并核验脚本本轮专属临时目录，避免误用用户原有目录。
-function New-TempRunDirectory {
+# 确保脚本专属临时目录存在，并避免误用同名文件。
+function New-TempRootDirectory {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TargetPath
+        [string]$RootPath
     )
 
-    $tempRootDirectory = Get-TempRootDirectory -TargetPath $TargetPath
-    $tempRunDirectory = [System.IO.Path]::Combine($tempRootDirectory, $TempRunId)
+    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
 
-    if (Test-Path -LiteralPath $tempRunDirectory -PathType Leaf) {
-        throw "临时目录路径被同名文件占用: $tempRunDirectory"
+    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
+        throw "临时目录路径被同名文件占用: $tempRootDirectory"
     }
 
-    New-Item -ItemType Directory -Path $tempRunDirectory -Force -ErrorAction Stop | Out-Null
-    $createdDirectory = Get-Item -LiteralPath $tempRunDirectory -ErrorAction Stop
+    New-Item -ItemType Directory -Path $tempRootDirectory -Force -ErrorAction Stop | Out-Null
+    $createdDirectory = Get-Item -LiteralPath $tempRootDirectory -ErrorAction Stop
     if (-not $createdDirectory.PSIsContainer) {
-        throw "临时路径不是文件夹: $tempRunDirectory"
+        throw "临时路径不是文件夹: $tempRootDirectory"
     }
 
     return $createdDirectory.FullName
+}
+
+# 获取目录中的项目数量，扫描隐藏项以确保临时目录真正为空。
+function Get-DirectoryItemCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$TreatErrorAsNonEmpty
+    )
+
+    try {
+        return @(Get-ChildItem -LiteralPath $DirectoryPath -Force -ErrorAction Stop).Count
+    }
+    catch {
+        if ($TreatErrorAsNonEmpty) {
+            return 1
+        }
+
+        throw
+    }
+}
+
+# 扫描前准备临时目录；如果已有内容，暂停等待用户清理后再继续。
+function Initialize-TempRootDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
+    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
+        throw "临时目录路径被同名文件占用: $tempRootDirectory"
+    }
+
+    if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
+        return (New-TempRootDirectory -RootPath $RootPath)
+    }
+
+    $tempRootItem = Get-Item -LiteralPath $tempRootDirectory -ErrorAction Stop
+    if (-not $tempRootItem.PSIsContainer) {
+        throw "临时路径不是文件夹: $tempRootDirectory"
+    }
+
+    while (Get-DirectoryItemCount -DirectoryPath $tempRootDirectory) {
+        Write-Host ""
+        Write-Host "临时目录已存在且不为空: $tempRootDirectory" -ForegroundColor Yellow
+        Write-Host "请先处理或清空此文件夹中的内容；处理完成后按 Enter 继续。" -ForegroundColor Yellow
+        Write-Host "如需退出脚本，请按 Ctrl+C。" -ForegroundColor DarkGray
+        [void](Read-Host "等待处理完成")
+
+        if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
+            return (New-TempRootDirectory -RootPath $RootPath)
+        }
+
+        if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
+            throw "临时目录路径被同名文件占用: $tempRootDirectory"
+        }
+    }
+
+    return $tempRootDirectory
+}
+
+# 尝试删除空的脚本专属临时目录；非空时保留，避免误删用户仍需处理的内容。
+function Remove-TempRootDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
+    if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
+        return $true
+    }
+
+    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
+        Write-Host "临时目录清理跳过: 路径被同名文件占用: $tempRootDirectory" -ForegroundColor Yellow
+        return $false
+    }
+
+    if (Get-DirectoryItemCount -DirectoryPath $tempRootDirectory) {
+        Write-Host "临时目录未清理: 目录仍有内容: $tempRootDirectory" -ForegroundColor Yellow
+        return $false
+    }
+
+    Remove-Item -LiteralPath $tempRootDirectory -Force -ErrorAction SilentlyContinue
+    return -not (Test-Path -LiteralPath $tempRootDirectory)
 }
 
 # 先保存到脚本专属临时目录，确认生成成功后再移动为目标文件，减少半成品残留风险。
 function New-TempOutputPath {
     param(
         [Parameter(Mandatory = $true)]
+        [string]$TempRootDirectory,
+
+        [Parameter(Mandatory = $true)]
         [string]$TargetPath
     )
 
-    $tempDirectory = New-TempRunDirectory -TargetPath $TargetPath
+    if (-not (Test-Path -LiteralPath $TempRootDirectory -PathType Container)) {
+        throw "临时目录不存在或不可用: $TempRootDirectory"
+    }
+
     $fileNameWithoutExtension = [System.IO.Path]::GetFileNameWithoutExtension($TargetPath)
     $extension = [System.IO.Path]::GetExtension($TargetPath)
-    return [System.IO.Path]::Combine($tempDirectory, "$fileNameWithoutExtension.tmp-$([guid]::NewGuid().ToString('N'))$extension")
+    return [System.IO.Path]::Combine($TempRootDirectory, "$fileNameWithoutExtension.tmp-$([guid]::NewGuid().ToString('N'))$extension")
 }
 
 # 尝试清理转换临时文件；OneDrive 目录可能短暂占用文件，因此失败时做少量重试。
@@ -430,7 +532,7 @@ function Remove-TempOutputFile {
     return -not (Test-Path -LiteralPath $TempOutputPath)
 }
 
-# 清理脚本本轮创建的空临时目录；如果里面还有文件则保留，避免误删用户内容。
+# 清理空的脚本专属临时目录；如果里面还有文件则保留，避免误删用户内容。
 function Remove-EmptyTempDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -442,21 +544,12 @@ function Remove-EmptyTempDirectory {
         return
     }
 
-    $remainingItems = @(Get-ChildItem -LiteralPath $tempDirectory -Force -ErrorAction SilentlyContinue)
-    if ($remainingItems.Count -eq 0) {
-        Remove-Item -LiteralPath $tempDirectory -Force -ErrorAction SilentlyContinue
-    }
-
-    $parentDirectory = [System.IO.Path]::GetDirectoryName($tempDirectory)
-    if ([string]::IsNullOrWhiteSpace($parentDirectory) -or
-        [System.IO.Path]::GetFileName($parentDirectory) -ne $TempRootDirectoryName -or
-        -not (Test-Path -LiteralPath $parentDirectory)) {
+    if ([System.IO.Path]::GetFileName($tempDirectory) -ne $TempRootDirectoryName) {
         return
     }
 
-    $remainingParentItems = @(Get-ChildItem -LiteralPath $parentDirectory -Force -ErrorAction SilentlyContinue)
-    if ($remainingParentItems.Count -eq 0) {
-        Remove-Item -LiteralPath $parentDirectory -Force -ErrorAction SilentlyContinue
+    if ((Get-DirectoryItemCount -DirectoryPath $tempDirectory -TreatErrorAsNonEmpty) -eq 0) {
+        Remove-Item -LiteralPath $tempDirectory -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -506,7 +599,7 @@ function Remove-ComObject {
     )
 
     if ($null -ne $ComObject) {
-        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject)
+        while ([System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject) -gt 0) {}
     }
 }
 
@@ -552,6 +645,9 @@ function Get-OfficeApplication {
 function Convert-OfficeFile {
     param(
         [Parameter(Mandatory = $true)]
+        [string]$TempRootDirectory,
+
+        [Parameter(Mandatory = $true)]
         [object]$Plan,
 
         [Parameter(Mandatory = $true)]
@@ -566,26 +662,23 @@ function Convert-OfficeFile {
             return [pscustomobject]@{ Status = 'Skipped'; Message = '目标文件已存在' }
         }
 
-        $tempOutputPath = New-TempOutputPath -TargetPath $Plan.TargetPath
+        $tempOutputPath = New-TempOutputPath -TempRootDirectory $TempRootDirectory -TargetPath $Plan.TargetPath
         $application = Get-OfficeApplication -AppName $Plan.AppName -ApplicationCache $ApplicationCache
         switch ($Plan.AppName) {
             'Word' {
                 $document = $application.Documents.Open($Plan.SourceFile.FullName, $false, $true, $false)
                 $document.SaveAs2($tempOutputPath, $Plan.FileFormat)
                 $document.Close($false)
-                $document = $null
             }
             'Excel' {
                 $document = $application.Workbooks.Open($Plan.SourceFile.FullName, 0, $true)
                 $document.SaveAs($tempOutputPath, $Plan.FileFormat)
                 $document.Close($false)
-                $document = $null
             }
             'PowerPoint' {
                 $document = $application.Presentations.Open($Plan.SourceFile.FullName, $true, $false, $false)
                 $document.SaveAs($tempOutputPath, $Plan.FileFormat)
                 $document.Close()
-                $document = $null
             }
         }
 
@@ -619,6 +712,7 @@ function Convert-OfficeFile {
     }
     finally {
         Remove-ComObject -ComObject $document
+        $document = $null
     }
 }
 
@@ -646,9 +740,12 @@ function Close-OfficeApplicationCache {
     [GC]::WaitForPendingFinalizers()
 }
 
-# 在 Office 应用退出后统一移动临时文件到目标位置，并用进度条展示移动进度。
+# 在 Office 应用退出后统一移动临时文件到目标位置，并用数量进度条展示移动进度。
 function Move-ConvertedOfficeFileList {
     param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempRootDirectory,
+
         [Parameter(Mandatory = $true)]
         [object[]]$TempConversionResults
     )
@@ -676,7 +773,7 @@ function Move-ConvertedOfficeFileList {
         $plan = $conversionResult.Plan
         $tempOutputPath = $conversionResult.TempOutputPath
 
-        Write-ProgressBar -Activity '移动转换文件' -Status "正在移动 $($plan.TargetPathText)" -ProcessedCount $processedCount -TotalCount $TempConversionResults.Count -LastPercent ([ref]$lastPercent)
+        Write-ProgressBar -Activity '移动转换文件' -Status '正在移动文件' -ProcessedCount $processedCount -TotalCount $TempConversionResults.Count -LastPercent ([ref]$lastPercent)
         Start-Sleep -Milliseconds $FileMoveDelayMilliseconds
 
         if (Test-Path -LiteralPath $plan.TargetPath) {
@@ -722,6 +819,10 @@ function Move-ConvertedOfficeFileList {
         Write-Host $failureMessage -ForegroundColor Red
     }
 
+    if (-not (Test-Path -LiteralPath $TempRootDirectory)) {
+        Write-Host "临时文件夹已清理。" -ForegroundColor Green
+    }
+
     return [pscustomobject]@{
         MovedCount   = $movedCount
         SkippedCount = $skippedCount
@@ -732,6 +833,9 @@ function Move-ConvertedOfficeFileList {
 # 执行转换计划：先输出跳过项，再逐个转换待处理文件并汇总结果。
 function Invoke-ConversionPlanList {
     param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempRootDirectory,
+
         [Parameter(Mandatory = $true)]
         [object[]]$ConversionPlans
     )
@@ -759,14 +863,14 @@ function Invoke-ConversionPlanList {
         foreach ($plan in $convertPlans) {
             $workingMessage = "正在转换: $($plan.SourcePathText)"
             $statusLineLength = Write-RefreshStatusLine -Message $workingMessage -Color White -NoNewLine
-            $result = Convert-OfficeFile -Plan $plan -ApplicationCache $applicationCache
+            $result = Convert-OfficeFile -TempRootDirectory $TempRootDirectory -Plan $plan -ApplicationCache $applicationCache
             switch ($result.Status) {
                 'ConvertedToTemp' {
                     [void](Write-RefreshStatusLine -Message "转换完成: $($plan.SourcePathText)" -Color Green -PreviousLength $statusLineLength)
                     $tempConversionResults.Add([pscustomobject]@{
-                        Plan           = $plan
-                        TempOutputPath = $result.TempOutputPath
-                    })
+                            Plan           = $plan
+                            TempOutputPath = $result.TempOutputPath
+                        })
                 }
                 'Skipped' {
                     [void](Write-RefreshStatusLine -Message "跳过: $($plan.TargetPathText)" -Color Yellow -PreviousLength $statusLineLength)
@@ -794,7 +898,7 @@ function Invoke-ConversionPlanList {
     }
 
     if ($tempConversionResults.Count -gt 0) {
-        $moveSummary = Move-ConvertedOfficeFileList -TempConversionResults $tempConversionResults.ToArray()
+        $moveSummary = Move-ConvertedOfficeFileList -TempRootDirectory $TempRootDirectory -TempConversionResults $tempConversionResults.ToArray()
         $movedCount += $moveSummary.MovedCount
         $skippedCount += $moveSummary.SkippedCount
         $failedCount += $moveSummary.FailedCount
@@ -832,12 +936,25 @@ catch {
     exit 1
 }
 
-$conversionPlans = @(New-ConversionPlanList -RootPath $resolvedPath)
-if ($conversionPlans.Count -eq 0) {
-    # 没有可处理文件时直接成功退出。
-    Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
-    exit 0
+try {
+    $tempRootDirectory = Initialize-TempRootDirectory -RootPath $resolvedPath
+}
+catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
 }
 
-[void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
-Invoke-ConversionPlanList -ConversionPlans $conversionPlans
+try {
+    $conversionPlans = @(New-ConversionPlanList -RootPath $resolvedPath)
+    if ($conversionPlans.Count -eq 0) {
+        # 没有可处理文件时直接成功结束，但仍会在 finally 中清理空临时目录。
+        Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
+    }
+    else {
+        [void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
+        Invoke-ConversionPlanList -TempRootDirectory $tempRootDirectory -ConversionPlans $conversionPlans
+    }
+}
+finally {
+    [void](Remove-TempRootDirectory -RootPath $resolvedPath)
+}

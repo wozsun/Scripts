@@ -248,7 +248,7 @@ _common_path_lower_extension() {
     print -r -- "${1:t:e:l}"
 }
 
-# 生成不冲突文件路径，冲突时在扩展名前追加 01-99。
+# 生成不冲突文件路径，冲突时在扩展名前追加 01-99；断开的符号链接按空位处理。
 _common_next_available_file_path() {
     emulate -L zsh -o typeset_silent
 
@@ -295,7 +295,7 @@ _common_move_file() {
     return 1
 }
 
-# 执行不覆盖目标的文件移动；用于原始媒体文件整理，避免竞态覆盖已有文件。
+# 执行不覆盖现有目标的文件移动；断开的符号链接按空位处理。
 _common_move_file_no_clobber() {
     emulate -L zsh -o typeset_silent
 

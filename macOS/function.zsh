@@ -153,18 +153,18 @@ EOF
 
         local file_name="${file_path:t}"
         local file_ext="$(_common_path_lower_extension "$file_path")"
-        local file_base="${file_path:t:r:l}"
+        local file_stem="${file_path:t:r:l}"
 
         # ete 允许文件名带 rtf 追加序号（如 YYYYMMDD_HHMMSS01），解析时仅取前 15 位时间主体
-        if ! _media_is_timestamp_name "$file_base"; then
+        if ! _media_is_timestamp_name "$file_stem"; then
             msg_error "文件名 \"$file_name\" 不符合 YYYYMMDD_HHMMSS[NN]，跳过。"
             ((failed_count++))
             continue
         fi
 
-        local base_time="$(_media_timestamp_body "$file_base")"
-        local formatted_time=$(date -j -f "%Y%m%d_%H%M%S" "$base_time" +"%Y:%m:%d %H:%M:%S" 2>/dev/null)
-        if [[ -z "$formatted_time" ]]; then
+        local filename_timestamp="$(_media_timestamp_body "$file_stem")"
+        local exif_datetime=$(date -j -f "%Y%m%d_%H%M%S" "$filename_timestamp" +"%Y:%m:%d %H:%M:%S" 2>/dev/null)
+        if [[ -z "$exif_datetime" ]]; then
             msg_error "无法从文件名 \"$file_name\" 解析时间，跳过。"
             ((failed_count++))
             continue
@@ -174,9 +174,9 @@ EOF
             heic)
                 msg_progress "检测到 HEIC 文件，正在修改对应时间标签..."
                 if ! exiftool \
-                    -CreateDate="$formatted_time" \
-                    -ModifyDate="$formatted_time" \
-                    -DateTimeOriginal="$formatted_time" \
+                    -CreateDate="$exif_datetime" \
+                    -ModifyDate="$exif_datetime" \
+                    -DateTimeOriginal="$exif_datetime" \
                     -OffsetTime="$time_zone" \
                     -OffsetTimeOriginal="$time_zone" \
                     -OffsetTimeDigitized="$time_zone" \
@@ -197,18 +197,18 @@ EOF
                     "$file_path"
                 ;;
             mov)
-                local adjusted_time="${formatted_time}${time_zone}"
+                local quicktime_datetime="${exif_datetime}${time_zone}"
                 msg_progress "检测到 MOV 文件，正在修改对应时间标签..."
                 if ! exiftool \
                     -api QuickTimeUTC=1 \
                     -overwrite_original \
-                    -CreateDate="$adjusted_time" \
-                    -ModifyDate="$adjusted_time" \
-                    -CreationDate="$adjusted_time" \
-                    -MediaCreateDate="$adjusted_time" \
-                    -MediaModifyDate="$adjusted_time" \
-                    -TrackCreateDate="$adjusted_time" \
-                    -TrackModifyDate="$adjusted_time" \
+                    -CreateDate="$quicktime_datetime" \
+                    -ModifyDate="$quicktime_datetime" \
+                    -CreationDate="$quicktime_datetime" \
+                    -MediaCreateDate="$quicktime_datetime" \
+                    -MediaModifyDate="$quicktime_datetime" \
+                    -TrackCreateDate="$quicktime_datetime" \
+                    -TrackModifyDate="$quicktime_datetime" \
                     "$file_path"; then
                     msg_error "修改时间标签失败: \"$file_path\""
                     ((failed_count++))
@@ -307,50 +307,50 @@ EOF
                 ;;
         esac
 
-        local original_time=""
+        local capture_time=""
         local candidate_time
         for candidate_time in "${capture_times[@]}"; do
             if [[ -n "$candidate_time" && "$candidate_time" != "-" ]]; then
-                original_time="$candidate_time"
+                capture_time="$candidate_time"
                 break
             fi
         done
 
-        if [[ -z "$original_time" ]]; then
+        if [[ -z "$capture_time" ]]; then
             msg_error "无法读取 \"$file_path\" 的拍摄时间，跳过。"
             ((failed_count++))
             continue
         fi
 
         # 仅用于命名：统一截取前 19 位 YYYY:MM:DD HH:MM:SS（忽略后续时区）
-        local name_time="${original_time:0:19}"
+        local capture_time_main="${capture_time:0:19}"
 
         # 将 Date 转换为 yyyymmdd_hhmmss 格式
-        local formatted_time=$(date -j -f "%Y:%m:%d %H:%M:%S" "$name_time" +"%Y%m%d_%H%M%S" 2>/dev/null)
-        if [[ -z "$formatted_time" ]]; then
+        local target_timestamp=$(date -j -f "%Y:%m:%d %H:%M:%S" "$capture_time_main" +"%Y%m%d_%H%M%S" 2>/dev/null)
+        if [[ -z "$target_timestamp" ]]; then
             msg_error "时间格式转换失败，跳过 \"$file_path\"。"
             ((failed_count++))
             continue
         fi
 
         local dir_path="${file_path:h}"
-        local base_name="$formatted_time"
+        local target_stem="$target_timestamp"
         local current_name_part="${file_path:t:r}"
-        local new_file_name=""
+        local new_file_path=""
 
-        if _media_is_timestamp_name "$current_name_part" && [[ "$(_media_timestamp_body "$current_name_part")" == "$formatted_time" ]]; then
+        if _media_is_timestamp_name "$current_name_part" && [[ "$(_media_timestamp_body "$current_name_part")" == "$target_timestamp" ]]; then
             msg_info "跳过: \"$file_path\" 已符合目标命名。"
             continue
         fi
 
-        if ! new_file_name="$(_common_next_available_file_path "$dir_path" "$base_name" "$file_ext")"; then
+        if ! new_file_path="$(_common_next_available_file_path "$dir_path" "$target_stem" "$file_ext")"; then
             msg_error "\"$file_path\" 的时间冲突超过 99 次，跳过。"
             ((failed_count++))
             continue
         fi
 
-        if _common_move_file_no_clobber "$file_path" "$new_file_name"; then
-            msg_success "文件 \"$file_path\" 已重命名为 \"$new_file_name\""
+        if _common_move_file_no_clobber "$file_path" "$new_file_path"; then
+            msg_success "文件 \"$file_path\" 已重命名为 \"$new_file_path\""
         else
             ((failed_count++))
         fi
@@ -991,6 +991,7 @@ _mtc_check_and_fix() {
 
     if [[ $metadata_consistent -eq 1 && $filename_consistent -eq 1 ]]; then
         msg_success "${label} \"$file_path\" 的时间数据与文件名一致"
+        return 0
     else
         msg_warn "${label} \"$file_path\" 的一致性检查未通过："
         for field_line; do
@@ -1005,8 +1006,10 @@ _mtc_check_and_fix() {
         msg_progress "执行修改操作..."
         if [[ $filename_valid -eq 1 ]]; then
             ete "$file_path"
+            return $?
         else
             msg_warn "跳过自动修复: 文件名非标准，无法按文件名写入时间"
+            return 1
         fi
     fi
 }

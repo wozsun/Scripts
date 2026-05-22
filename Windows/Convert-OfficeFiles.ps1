@@ -663,8 +663,8 @@ function Remove-TempOutputFile {
     return -not (Test-Path -LiteralPath $TempOutputPath)
 }
 
-# 清理空的脚本专属临时目录；如果里面还有文件则保留，避免误删用户内容。
-function Remove-EmptyTempDirectory {
+# 根据临时输出文件路径清理其所在的空临时目录；如果里面还有文件则保留，避免误删用户内容。
+function Remove-TempOutputDirectoryIfEmpty {
     param(
         [Parameter(Mandatory = $true)]
         [string]$TempOutputPath
@@ -684,8 +684,8 @@ function Remove-EmptyTempDirectory {
     }
 }
 
-# 验证临时文件移动结果，确保目标文件存在，并尽量清理移动后仍残留的临时文件。
-function Test-TempOutputMoveResult {
+# 获取临时文件移动结果，确保目标文件存在，并尽量清理移动后仍残留的临时文件。
+function Get-TempOutputMoveResult {
     param(
         [Parameter(Mandatory = $true)]
         [string]$TempOutputPath,
@@ -836,7 +836,7 @@ function Convert-OfficeFile {
 
         if (-not [string]::IsNullOrWhiteSpace($tempOutputPath)) {
             [void](Remove-TempOutputFile -TempOutputPath $tempOutputPath)
-            Remove-EmptyTempDirectory -TempOutputPath $tempOutputPath
+            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
         }
 
         return [pscustomobject]@{ Status = 'Failed'; Message = $_.Exception.Message }
@@ -909,7 +909,7 @@ function Move-ConvertedOfficeFileList {
 
         if (Test-Path -LiteralPath $plan.TargetPath) {
             if (Remove-TempOutputFile -TempOutputPath $tempOutputPath) {
-                Remove-EmptyTempDirectory -TempOutputPath $tempOutputPath
+                Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
                 $warningMessages.Add("跳过移动: $($plan.TargetPathText)`n  原因: 目标文件已存在，临时文件已清理")
             }
             else {
@@ -922,7 +922,7 @@ function Move-ConvertedOfficeFileList {
 
         try {
             Move-Item -LiteralPath $tempOutputPath -Destination $plan.TargetPath -ErrorAction Stop
-            $moveResult = Test-TempOutputMoveResult -TempOutputPath $tempOutputPath -TargetPath $plan.TargetPath
+            $moveResult = Get-TempOutputMoveResult -TempOutputPath $tempOutputPath -TargetPath $plan.TargetPath
             if (-not $moveResult.IsValid) {
                 throw $moveResult.Message
             }
@@ -931,7 +931,7 @@ function Move-ConvertedOfficeFileList {
                 $warningMessages.Add("移动完成但临时文件清理失败: $($plan.TargetPathText)`n  临时文件: $($moveResult.CleanupPath)")
             }
 
-            Remove-EmptyTempDirectory -TempOutputPath $tempOutputPath
+            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
             $movedCount++
         }
         catch {

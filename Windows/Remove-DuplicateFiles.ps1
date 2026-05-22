@@ -649,7 +649,7 @@ function Read-InteractivePathList {
         $candidatePathList = @($inputPathList.ToArray()) + $resolvedPathInputList
 
         try {
-            Test-IndependentDirectorySet -RootPathList $candidatePathList
+            Assert-IndependentDirectorySet -RootPathList $candidatePathList
         }
         catch {
             Write-Host "路径无效，请不要输入相同目录、父子目录或互相包含的目录。本次输入不保留。" -ForegroundColor Yellow
@@ -692,7 +692,7 @@ function Add-TrailingDirectorySeparator {
 }
 
 # 同一次扫描中的目录必须互不包含，避免同一文件被重复扫描或重复处理。
-function Test-IndependentDirectoryPair {
+function Assert-IndependentDirectoryPair {
     param(
         [Parameter(Mandatory = $true)]
         [string]$LeftRootPath,
@@ -727,7 +727,7 @@ function Test-IndependentDirectoryPair {
 }
 
 # 校验一组目录两两独立，避免同一文件在一次运行中被重复扫描或重复处理。
-function Test-IndependentDirectorySet {
+function Assert-IndependentDirectorySet {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$RootPathList
@@ -735,7 +735,7 @@ function Test-IndependentDirectorySet {
 
     for ($leftIndex = 0; $leftIndex -lt $RootPathList.Count; $leftIndex++) {
         for ($rightIndex = $leftIndex + 1; $rightIndex -lt $RootPathList.Count; $rightIndex++) {
-            Test-IndependentDirectoryPair `
+            Assert-IndependentDirectoryPair `
                 -LeftRootPath $RootPathList[$leftIndex] `
                 -RightRootPath $RootPathList[$rightIndex] `
                 -LeftName "Path$($leftIndex + 1)" `
@@ -1135,7 +1135,7 @@ function Write-DeletionPlanSummary {
         [string]$SummaryMessageTemplate
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanMetric -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
     $plannedDeletionCount = $deletionPlanStatistics.DeletionItemCount
 
     Write-Host ""
@@ -1753,7 +1753,7 @@ function Format-ByteSize {
 }
 
 # 统一统计删除计划数量和预计可释放空间，供预览、-yes 和最终删除流程复用。
-function Get-DeletionPlanMetric {
+function Get-DeletionPlanStatistics {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
@@ -1812,7 +1812,7 @@ function Invoke-DeletionPlanAction {
         [hashtable]$ManualDisplayPathByFullName
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanMetric -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
     if ($DeletionPlanList.Count -eq 0 -or $deletionPlanStatistics.DeletionItemCount -eq 0) {
         Write-Host $EmptyMessage -ForegroundColor Green
         return 'Continue'
@@ -2288,7 +2288,7 @@ function Invoke-DuplicateScanRun {
     }
 
     $resolvedPathList = @(Resolve-InputDirectoryList -PathList $InputPathList)
-    Test-IndependentDirectorySet -RootPathList $resolvedPathList
+    Assert-IndependentDirectorySet -RootPathList $resolvedPathList
 
     if ($UseReferenceMode) {
         return (Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList @($resolvedPathList | Select-Object -Skip 1))

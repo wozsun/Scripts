@@ -266,8 +266,8 @@ function Add-TrailingDirectorySeparator {
     return "$DirectoryPath$([System.IO.Path]::DirectorySeparatorChar)"
 }
 
-# 计算路径层级，用于从深到浅处理目录。
-function Get-PathDepth {
+# 计算目录路径层级，用于从深到浅处理目录。
+function Get-DirectoryPathDepth {
     param(
         [Parameter(Mandatory = $true)]
         [string]$DirectoryPath
@@ -552,7 +552,7 @@ function New-EmptyFolderDeletionPlan {
     }
 
     $sortedDirectoryList = @($allDirectoryList | Sort-Object `
-            @{ Expression = { Get-PathDepth -DirectoryPath $_.FullName }; Descending = $true }, `
+            @{ Expression = { Get-DirectoryPathDepth -DirectoryPath $_.FullName }; Descending = $true }, `
             @{ Expression = { $_.FullName }; Descending = $true })
 
     $activity = '空文件夹判断'
@@ -753,7 +753,7 @@ function Invoke-EmptyFolderDeletion {
     }
 
     $orderedTargetList = @($TargetDirectoryList | Sort-Object `
-            @{ Expression = { Get-PathDepth -DirectoryPath $_.FullName }; Descending = $true }, `
+            @{ Expression = { Get-DirectoryPathDepth -DirectoryPath $_.FullName }; Descending = $true }, `
             @{ Expression = { $_.FullName }; Descending = $true })
 
     $deletedList = [System.Collections.Generic.List[string]]::new()

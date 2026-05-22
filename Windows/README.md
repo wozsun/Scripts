@@ -4,7 +4,7 @@
 
 ## Convert-OfficeFiles.ps1
 
-`Convert-OfficeFiles.ps1` 用于调用本机 Office 原生应用，将指定文件夹下的 `.doc`、`.xls`、`.ppt` 转换为 `.docx`、`.xlsx`、`.pptx`。
+`Convert-OfficeFiles.ps1` 用于调用本机 Office 原生应用，将指定文件或文件夹下的 `.doc`、`.xls`、`.ppt` 转换为 `.docx`、`.xlsx`、`.pptx`。
 
 脚本需要 PowerShell 7 和本机已安装的桌面版 Office。脚本默认保留原始文件；如果目标新格式文件已经存在，会提示并跳过，不会覆盖。脚本只创建新格式文件，不需要预览确认。
 
@@ -12,7 +12,7 @@
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `Path` | 是 | 无 | 要扫描的文件夹绝对路径。 |
+| `Path` | 是 | 无 | 一个或多个文件或文件夹绝对路径；文件会直接转换，文件夹会递归扫描。 |
 | `-s` | 否 | 关闭 | 包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。 |
 | `-h` | 否 | 关闭 | 显示帮助信息。 |
 
@@ -30,6 +30,12 @@ pwsh -File .\Convert-OfficeFiles.ps1 -h
 pwsh -File .\Convert-OfficeFiles.ps1 "C:\Path\Folder"
 ```
 
+直接转换一个或多个旧格式 Office 文件：
+
+```powershell
+pwsh -File .\Convert-OfficeFiles.ps1 "C:\Path\A.doc" "C:\Path\B.xls" "C:\Path\C.ppt"
+```
+
 包含隐藏文件和隐藏文件夹：
 
 ```powershell
@@ -38,7 +44,7 @@ pwsh -File .\Convert-OfficeFiles.ps1 -s "C:\Path\Folder"
 
 ### 注意事项
 
-- 路径必须是 Windows 文件夹绝对路径，例如 `C:\Users\Name\Documents`；交互输入时可以粘贴带首尾引号的路径。
+- 路径必须是 Windows 文件或文件夹绝对路径，例如 `C:\Users\Name\Documents` 或 `C:\Users\Name\Documents\A.doc`；交互输入时可以粘贴带首尾引号的路径。
 - 脚本使用 Word、Excel、PowerPoint 的原生 COM 自动化能力，需要本机安装桌面版 Office。
 - 脚本默认保留原始 `.doc`、`.xls`、`.ppt` 文件。
 - 脚本只创建新格式文件，不删除、移动或覆盖原始文件，因此不会展示预览菜单。
@@ -47,14 +53,14 @@ pwsh -File .\Convert-OfficeFiles.ps1 -s "C:\Path\Folder"
 - 有密码、损坏、受保护视图、外部链接或需要人工确认的文件可能转换失败。
 - 每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 - 扫描前会检查输入目录下的 `.convert-officefiles-tmp`：不存在则创建，已存在且为空则复用，已存在且不为空时会暂停，等待用户处理完内容后再继续。
-- 转换时会使用输入目录下的 `.convert-officefiles-tmp` 保存临时文件；全部文件转换完成并退出 Office 后，再统一移动到目标位置。
+- 转换时会使用输入目录下的 `.convert-officefiles-tmp` 保存临时文件；直接传入文件时，临时文件夹位于该文件所在目录。全部文件转换完成并退出 Office 后，再统一移动到目标位置。
 - 统一移动阶段会显示百分比进度条和文件数量，每个文件移动前默认等待 `200ms`；如需调整，可修改脚本顶部的 `$FileMoveDelayMilliseconds` 配置项。
 - 移动完成后脚本会自动清理本次运行创建的临时文件；如果 `.convert-officefiles-tmp` 已空，也会自动清理该文件夹。
 - 转换过程会启动 Office 应用实例，转换完成后脚本会自动退出这些实例。
 
 ### 执行流程
 
-脚本会先检查并准备输入目录下的 `.convert-officefiles-tmp`，再扫描并输出转换计划摘要，然后把所有目标不存在的旧格式文件转换到该临时文件夹。全部转换完成后，脚本会退出 Office 应用实例，再统一移动临时文件到目标位置。目标文件已存在时会逐条提示并跳过。
+脚本会按输入目录或直接文件所在目录分组，先检查并准备对应的 `.convert-officefiles-tmp`，再扫描或检查输入文件并输出转换计划摘要，然后把所有目标不存在的旧格式文件转换到该临时文件夹。全部转换完成后，脚本会退出 Office 应用实例，再统一移动临时文件到目标位置。目标文件已存在时会逐条提示并跳过。
 
 ## Remove-DuplicateFiles.ps1
 
@@ -124,7 +130,7 @@ pwsh -File .\Remove-DuplicateFiles.ps1 -c "C:\Path\Reference" "C:\Path\TargetA" 
 - 交互路径输入阶段，`0` 返回模式菜单，`00` 直接退出脚本；返回菜单时会放弃本次已输入但未执行的路径。
 - 交互模式下，每轮扫描和删除流程完成后会回到扫描模式菜单；带路径参数运行时只执行一轮，便于命令行批处理。
 - 所有模式都会拒绝相同目录、父子目录和互相嵌套目录，避免同一文件在一次运行中被重复扫描或重复处理。
-- 除 `-yes` 外，删除前会先显示详细预览；`-yes` 会输出汇总后进入倒计时。单目录和多目录合并模式提供 `默认删除 / 手动删除 / 跳过本次操作 / 退出脚本`，参考目录模式提供 `默认删除 / 跳过本次操作 / 退出脚本`。多个单目录逐个操作时，`0` 表示跳过当前目录，`00` 表示退出脚本。
+- 除 `-yes` 外，删除前会先显示详细预览；预览和删除摘要会显示计划删除数量以及预计可释放空间。`-yes` 会输出汇总后进入倒计时；没有可删除项时会直接跳过。单目录和多目录合并模式提供 `默认删除 / 手动删除 / 跳过本次操作 / 退出脚本`，参考目录模式提供 `默认删除 / 跳过本次操作 / 退出脚本`。多个单目录逐个操作时，`0` 表示跳过当前目录，`00` 表示退出脚本。
 - 默认保留规则：同一目录内优先保留文件名更短的文件；不同目录之间优先保留父目录中的文件；不属于父子目录时，优先保留目录层级更少的文件；目录层级相同时，优先保留目录路径更短的文件；仍相同时按文件名和完整路径排序。
 - 删除使用 `Remove-Item`，不会进入回收站；扫描、哈希或删除失败时会提示并继续处理后续文件。
 - `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，使用 UTF-8 with BOM 保存；允许脚本执行可运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。

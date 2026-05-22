@@ -1,12 +1,12 @@
 #requires -Version 7.0
 <#
 用途：
-  使用本机 Office 原生应用，将指定文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
+  使用本机 Office 原生应用，将指定文件或文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
 
 参数：
   -h     显示帮助信息。
   -s     包含隐藏文件和隐藏文件夹。
-  Path   要扫描的文件夹绝对路径。
+  Path   一个或多个文件或文件夹绝对路径。
 
 关键规则：
   默认保留原始文件。
@@ -24,8 +24,8 @@ param(
     [Alias('s')]
     [switch]$IncludeHidden,
 
-    [Parameter(Mandatory = $false, Position = 0)]
-    [string]$Path
+    [Parameter(Mandatory = $false, Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$PathList
 )
 
 # ========== 可调整配置 ==========
@@ -78,13 +78,16 @@ $ShouldIncludeHiddenItems = [bool]$IncludeHidden
 function Show-HelpText {
     Write-Host @'
 用途：
-  使用本机 Office 原生应用，将指定文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
+  使用本机 Office 原生应用，将指定文件或文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
 
 用法：
-  pwsh -File .\Convert-OfficeFiles.ps1 [-s] <Path>
+  pwsh -File .\Convert-OfficeFiles.ps1 [-s] <Path1> [Path2 ...]
   pwsh -File .\Convert-OfficeFiles.ps1 -h
 
 参数：
+  Path
+    一个或多个文件或文件夹绝对路径。文件路径会直接转换；文件夹路径会递归扫描。
+
   -s
     包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
 
@@ -92,8 +95,8 @@ function Show-HelpText {
   默认保留原始 .doc、.xls、.ppt 文件。
   如果目标 .docx、.xlsx、.pptx 已存在，则跳过，不覆盖。
   脚本扫描后直接转换，不需要预览确认。
-  扫描前会检查输入目录下的专属临时文件夹；如已有内容，会等待用户清理。
-  脚本会先转换到输入目录下的专属临时文件夹，退出 Office 后再统一移动到目标位置。
+  扫描前会检查输入目录或直接文件所在目录下的专属临时文件夹；如已有内容，会等待用户清理。
+  脚本会先转换到该专属临时文件夹，退出 Office 后再统一移动到目标位置。
   每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 '@
 }
@@ -233,30 +236,42 @@ function ConvertTo-UnquotedPathText {
     return $normalizedPathText
 }
 
-# 校验输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件夹。
-function Resolve-InputDirectory {
+# 校验输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件或文件夹。
+function Resolve-InputPath {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$PathText
+        [string]$PathText,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ParameterName = 'Path'
     )
 
     $normalizedPathText = ConvertTo-UnquotedPathText -PathText $PathText
     $isAbsolutePath = $normalizedPathText -match '^[a-zA-Z]:[\\/]' -or $normalizedPathText -match '^[\\/]{2}'
     if (-not $isAbsolutePath) {
-        throw 'Path 必须是 Windows 文件夹绝对路径。'
+        throw "$ParameterName 必须是 Windows 文件或文件夹绝对路径。"
     }
 
     $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
     if ($resolvedPaths.Count -ne 1) {
-        throw 'Path 必须只能解析到一个目录。'
+        throw "$ParameterName 必须只能解析到一个文件或文件夹。"
     }
 
-    $item = Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop
-    if (-not $item.PSIsContainer) {
-        throw 'Path 必须是文件夹。'
-    }
+    return (Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop)
+}
 
-    return $item.FullName
+# 逐个校验输入路径，并返回文件系统对象。
+function Resolve-InputPathList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$InputPathList
+    )
+
+    return @(
+        for ($index = 0; $index -lt $InputPathList.Count; $index++) {
+            Resolve-InputPath -PathText $InputPathList[$index] -ParameterName "Path$($index + 1)"
+        }
+    )
 }
 
 # 输出相对路径用于展示，避免终端日志被完整绝对路径撑得过长。
@@ -281,30 +296,39 @@ function Get-RelativePathText {
 function Get-LegacyOfficeFileList {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $false)]
+        [System.IO.FileInfo[]]$SourceFileList
     )
 
-    Write-StageMessage "开始扫描目录: $RootPath"
-    $scanErrors = $null
-    if ($ShouldIncludeHiddenItems) {
-        $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
+    if ($null -ne $SourceFileList) {
+        Write-StageMessage "开始处理直接输入文件，文件数: $($SourceFileList.Count)"
+        $files = @($SourceFileList)
     }
     else {
-        $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
-    }
-
-    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
-    $separatorCharacters = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $tempRootPrefix = $tempRootDirectory.TrimEnd($separatorCharacters) + [System.IO.Path]::DirectorySeparatorChar
-    $files = @(
-        $files | Where-Object {
-            -not $_.FullName.StartsWith($tempRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        Write-StageMessage "开始扫描目录: $RootPath"
+        $scanErrors = $null
+        if ($ShouldIncludeHiddenItems) {
+            $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
         }
-    )
+        else {
+            $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
+        }
 
-    foreach ($scanError in @($scanErrors)) {
-        Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
-        Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
+        $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
+        $separatorCharacters = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $tempRootPrefix = $tempRootDirectory.TrimEnd($separatorCharacters) + [System.IO.Path]::DirectorySeparatorChar
+        $files = @(
+            $files | Where-Object {
+                -not $_.FullName.StartsWith($tempRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+        )
+
+        foreach ($scanError in @($scanErrors)) {
+            Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
+            Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
+        }
     }
 
     $legacyFiles = @(
@@ -314,7 +338,13 @@ function Get-LegacyOfficeFileList {
     )
 
     $hiddenModeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
-    Write-StageMessage "扫描完成，文件数: $($files.Count)，旧格式 Office 文件: $($legacyFiles.Count)，$hiddenModeText"
+    if ($null -ne $SourceFileList) {
+        Write-StageMessage "直接输入文件检查完成，文件数: $($files.Count)，旧格式 Office 文件: $($legacyFiles.Count)"
+    }
+    else {
+        Write-StageMessage "扫描完成，文件数: $($files.Count)，旧格式 Office 文件: $($legacyFiles.Count)，$hiddenModeText"
+    }
+
     return $legacyFiles
 }
 
@@ -322,10 +352,16 @@ function Get-LegacyOfficeFileList {
 function New-ConversionPlanList {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $false)]
+        [System.IO.FileInfo[]]$SourceFileList,
+
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.HashSet[string]]$ProcessedSourcePathSet
     )
 
-    $legacyFiles = @(Get-LegacyOfficeFileList -RootPath $RootPath)
+    $legacyFiles = @(Get-LegacyOfficeFileList -RootPath $RootPath -SourceFileList $SourceFileList)
     $plans = [System.Collections.Generic.List[object]]::new()
     $processedCount = 0
     $lastPercent = -1
@@ -333,6 +369,10 @@ function New-ConversionPlanList {
     foreach ($file in $legacyFiles) {
         $processedCount++
         Write-ProgressBar -Activity '转换计划生成' -Status '正在检查目标文件' -ProcessedCount $processedCount -TotalCount $legacyFiles.Count -LastPercent ([ref]$lastPercent)
+
+        if ($null -ne $ProcessedSourcePathSet -and -not $ProcessedSourcePathSet.Add($file.FullName)) {
+            continue
+        }
 
         $format = $OfficeFormatMap[$file.Extension.ToLowerInvariant()]
         $targetPath = [System.IO.Path]::ChangeExtension($file.FullName, $format.TargetExtension)
@@ -351,6 +391,50 @@ function New-ConversionPlanList {
 
     Complete-ProgressBar
     return $plans.ToArray()
+}
+
+# 将输入文件/目录整理为转换作用域；直接文件按父目录分组，共用同一个临时目录。
+function New-ConversionScopeList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileSystemInfo[]]$InputItemList
+    )
+
+    $scopeList = [System.Collections.Generic.List[object]]::new()
+    $directoryRootSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $directFileScopeByRoot = @{}
+
+    foreach ($inputItem in $InputItemList) {
+        if ($inputItem -is [System.IO.DirectoryInfo]) {
+            if ($directoryRootSet.Add($inputItem.FullName)) {
+                $scopeList.Add([pscustomobject]@{
+                        RootPath       = $inputItem.FullName
+                        SourceFileList = $null
+                        Label          = "目录: $($inputItem.FullName)"
+                    })
+            }
+            continue
+        }
+
+        if (-not $OfficeFormatMap.ContainsKey($inputItem.Extension.ToLowerInvariant())) {
+            Write-Host "跳过不支持的文件: $($inputItem.FullName)" -ForegroundColor Yellow
+            continue
+        }
+
+        $rootPath = Split-Path -Parent $inputItem.FullName
+        if (-not $directFileScopeByRoot.ContainsKey($rootPath)) {
+            $directFileScopeByRoot[$rootPath] = [pscustomobject]@{
+                RootPath       = $rootPath
+                SourceFileList = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+                Label          = "直接文件所在目录: $rootPath"
+            }
+            $scopeList.Add($directFileScopeByRoot[$rootPath])
+        }
+
+        $directFileScopeByRoot[$rootPath].SourceFileList.Add([System.IO.FileInfo]$inputItem)
+    }
+
+    return $scopeList.ToArray()
 }
 
 # 输出转换计划摘要。新建文件操作不需要预览确认，但仍给出数量概览。
@@ -917,44 +1001,69 @@ if ($Help) {
     exit 0
 }
 
-if ([string]::IsNullOrWhiteSpace($Path)) {
-    # 未传入必填路径时，引导用户输入，直接回车则安全退出。
-    Write-Host "未提供 Path。请输入要扫描的文件夹绝对路径；直接回车退出。" -ForegroundColor Yellow
-    $Path = (Read-Host 'Path').Trim()
-    if ([string]::IsNullOrWhiteSpace($Path)) {
+if ($null -eq $PathList -or $PathList.Count -eq 0) {
+    # 未传入路径时，引导用户输入一个文件或文件夹，直接回车则安全退出。
+    Write-Host "未提供 Path。请输入要转换的文件或要扫描的文件夹绝对路径；直接回车退出。" -ForegroundColor Yellow
+    $pathInput = (Read-Host 'Path').Trim()
+    if ([string]::IsNullOrWhiteSpace($pathInput)) {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
     }
+
+    $PathList = @($pathInput)
 }
 
 try {
     # 在正式扫描前集中校验路径，避免后续函数反复处理无效输入。
-    $resolvedPath = Resolve-InputDirectory -PathText $Path
+    $effectivePathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($effectivePathList.Count -eq 0) {
+        Write-Host "未提供有效路径，已退出。" -ForegroundColor Yellow
+        exit 0
+    }
+
+    $resolvedInputItemList = @(Resolve-InputPathList -InputPathList $effectivePathList)
+    $conversionScopeList = @(New-ConversionScopeList -InputItemList $resolvedInputItemList)
 }
 catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1
 }
 
-try {
-    $tempRootDirectory = Initialize-TempRootDirectory -RootPath $resolvedPath
-}
-catch {
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    exit 1
+if ($conversionScopeList.Count -eq 0) {
+    Write-Host "未发现可处理的 .doc、.xls、.ppt 文件或目录。" -ForegroundColor Green
+    exit 0
 }
 
-try {
-    $conversionPlans = @(New-ConversionPlanList -RootPath $resolvedPath)
-    if ($conversionPlans.Count -eq 0) {
-        # 没有可处理文件时直接成功结束，但仍会在 finally 中清理空临时目录。
-        Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
+$processedSourcePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$scopeIndex = 0
+foreach ($conversionScope in $conversionScopeList) {
+    $scopeIndex++
+    if ($conversionScopeList.Count -gt 1) {
+        Write-Host ""
+        Write-Host "转换范围 $scopeIndex / $($conversionScopeList.Count): $($conversionScope.Label)" -ForegroundColor Cyan
     }
-    else {
-        [void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
-        Invoke-ConversionPlanList -TempRootDirectory $tempRootDirectory -ConversionPlans $conversionPlans
+
+    try {
+        $tempRootDirectory = Initialize-TempRootDirectory -RootPath $conversionScope.RootPath
     }
-}
-finally {
-    [void](Remove-TempRootDirectory -RootPath $resolvedPath)
+    catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        exit 1
+    }
+
+    try {
+        $sourceFileList = if ($null -eq $conversionScope.SourceFileList) { $null } else { $conversionScope.SourceFileList.ToArray() }
+        $conversionPlans = @(New-ConversionPlanList -RootPath $conversionScope.RootPath -SourceFileList $sourceFileList -ProcessedSourcePathSet $processedSourcePathSet)
+        if ($conversionPlans.Count -eq 0) {
+            # 没有可处理文件时直接成功结束，但仍会在 finally 中清理空临时目录。
+            Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
+        }
+        else {
+            [void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
+            Invoke-ConversionPlanList -TempRootDirectory $tempRootDirectory -ConversionPlans $conversionPlans
+        }
+    }
+    finally {
+        [void](Remove-TempRootDirectory -RootPath $conversionScope.RootPath)
+    }
 }

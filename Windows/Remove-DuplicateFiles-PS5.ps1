@@ -111,6 +111,8 @@ function Show-HelpText {
 
 说明：
   无路径且未指定 -a/-c 时，会先显示模式菜单。
+  预览和删除摘要会显示计划删除数量以及预计可释放空间。
+  -yes 模式没有可删除项时会直接跳过，不进入倒计时。
   交互模式每轮流程完成后会返回模式菜单；命令行带路径运行时执行一次后退出。
   所有交互位置中，00 表示退出脚本，0 只表示返回或跳过。
   路径输入阶段可输入 0 返回模式菜单，输入 00 退出脚本。
@@ -1020,10 +1022,18 @@ function New-DeletionItemList {
     return @(
         $FileList | ForEach-Object {
             $displayPath = Get-FileDisplayPath -File $_ -RootPath $RootPath -PathPrefix $PathPrefix -DisplayPathByFullName $DisplayPathByFullName
+            $byteCount = 0
+            try {
+                $byteCount = [long]$_.Length
+            }
+            catch {
+                Write-Debug "读取文件大小失败: $($_.Exception.Message)"
+            }
 
             [pscustomobject]@{
                 File        = $_
                 DisplayPath = $displayPath
+                ByteCount   = $byteCount
             }
         }
     )
@@ -1166,22 +1176,25 @@ function Write-DeletionPlanSummary {
         [string]$SummaryMessageTemplate
     )
 
-    $plannedDeletionCount = 0
-    $plannedKeepCount = 0
-    foreach ($deletionPlan in $DeletionPlanList) {
-        $plannedDeletionItems = @($deletionPlan.DeletionItems)
-        $plannedDeletionCount += $plannedDeletionItems.Count
-        $plannedKeepCount++
-    }
+    $deletionPlanStatistics = Get-DeletionPlanMetric -DeletionPlanList $DeletionPlanList
+    $plannedDeletionCount = $deletionPlanStatistics.DeletionItemCount
 
     Write-Host ""
     Write-Host -NoNewline "重复组数: " -ForegroundColor White
-    Write-Host -NoNewline $DeletionPlanList.Count -ForegroundColor Cyan
+    Write-Host -NoNewline $deletionPlanStatistics.GroupCount -ForegroundColor Cyan
     Write-Host -NoNewline "，默认保留文件数: " -ForegroundColor White
-    Write-Host -NoNewline $plannedKeepCount -ForegroundColor Green
+    Write-Host -NoNewline $deletionPlanStatistics.KeepFileCount -ForegroundColor Green
     Write-Host -NoNewline "，默认计划删除文件数: " -ForegroundColor White
-    Write-Host $plannedDeletionCount -ForegroundColor Red
-    Write-StatusSummary -Message ($SummaryMessageTemplate -f $plannedDeletionCount) -Color Yellow
+    Write-Host -NoNewline $plannedDeletionCount -ForegroundColor Red
+    Write-Host -NoNewline "，可释放 " -ForegroundColor White
+    Write-Host $deletionPlanStatistics.ReclaimableSizeText -ForegroundColor Magenta
+
+    $summaryMessage = $SummaryMessageTemplate -f $plannedDeletionCount
+    if ($plannedDeletionCount -gt 0) {
+        $summaryMessage = "$summaryMessage，可释放 $($deletionPlanStatistics.ReclaimableSizeText)"
+    }
+
+    Write-StatusSummary -Message $summaryMessage -Color Yellow
     return $plannedDeletionCount
 }
 
@@ -1392,7 +1405,13 @@ function Invoke-DefaultDeletionPlan {
     )
 
     $deletionResult = Remove-DeletionItemList -DeletionItemList @($DeletionPlanList | ForEach-Object { $_.DeletionItems })
-    Write-StatusSummary -Message ($SummaryMessageTemplate -f $deletionResult.DeletedCount) -Color Magenta
+    $deletedByteCount = Get-DeletionItemTotalByteCount -DeletionItemList @($deletionResult.DeletedItems)
+    $summaryMessage = $SummaryMessageTemplate -f $deletionResult.DeletedCount
+    if ($deletionResult.DeletedCount -gt 0) {
+        $summaryMessage = "$summaryMessage，已释放 $(Format-ByteSize -ByteCount $deletedByteCount)"
+    }
+
+    Write-StatusSummary -Message $summaryMessage -Color Magenta
     if ($deletionResult.FailedCount -gt 0) {
         Write-Host "删除失败文件: $($deletionResult.FailedCount)" -ForegroundColor Red
     }
@@ -1646,6 +1665,7 @@ function Invoke-ManualDeletion {
 
     $deletedFileCount = 0
     $failedFileCount = 0
+    $deletedItemList = New-Object System.Collections.Generic.List[object]
     foreach ($deletionPlan in $DeletionPlanList) {
         $manualSelection = Read-ManualDeletionSelection -DuplicateFileGroup $deletionPlan.DuplicateFiles -DefaultKeepFile $deletionPlan.KeepFile -RootPath $RootPath -DisplayPathByFullName $DisplayPathByFullName -Hash $deletionPlan.Hash
         if ($manualSelection.Action -eq 'Exit') {
@@ -1684,13 +1704,17 @@ function Invoke-ManualDeletion {
         }
         $deletedFileCount += $deletionResult.DeletedCount
         $failedFileCount += $deletionResult.FailedCount
+        foreach ($deletedItem in @($deletionResult.DeletedItems)) {
+            $deletedItemList.Add($deletedItem)
+        }
     }
 
     if ($deletedFileCount -eq 0) {
         Write-Host "未选择删除任何文件。" -ForegroundColor Yellow
     }
     else {
-        Write-StatusSummary -Message "手动删除完成。已删除重复文件: $deletedFileCount" -Color Magenta
+        $deletedByteCount = Get-DeletionItemTotalByteCount -DeletionItemList $deletedItemList.ToArray()
+        Write-StatusSummary -Message "手动删除完成。已删除重复文件: $deletedFileCount，已释放 $(Format-ByteSize -ByteCount $deletedByteCount)" -Color Magenta
     }
 
     if ($failedFileCount -gt 0) {
@@ -1714,6 +1738,90 @@ function Get-DeletionPlanItemCount {
     }
 
     return $deletionItemCount
+}
+
+# 汇总删除项文件大小；文件已不可读时跳过，避免摘要统计影响主流程。
+function Get-DeletionItemTotalByteCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DeletionItemList
+    )
+
+    [long]$totalByteCount = 0
+    foreach ($deletionItem in $DeletionItemList) {
+        try {
+            if ($null -ne $deletionItem.PSObject.Properties['ByteCount']) {
+                $totalByteCount += [long]$deletionItem.ByteCount
+                continue
+            }
+
+            if ($null -ne $deletionItem.File) {
+                $totalByteCount += [long]$deletionItem.File.Length
+            }
+        }
+        catch {
+            Write-Debug "统计文件大小失败: $($_.Exception.Message)"
+        }
+    }
+
+    return $totalByteCount
+}
+
+# 将字节数格式化为便于判断释放价值的大小文本。
+function Format-ByteSize {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$ByteCount
+    )
+
+    if ($ByteCount -lt 1KB) {
+        return "$ByteCount B"
+    }
+
+    $unitList = @(
+        [pscustomobject]@{ Name = 'TB'; Size = 1TB }
+        [pscustomobject]@{ Name = 'GB'; Size = 1GB }
+        [pscustomobject]@{ Name = 'MB'; Size = 1MB }
+        [pscustomobject]@{ Name = 'KB'; Size = 1KB }
+    )
+
+    foreach ($unit in $unitList) {
+        if ($ByteCount -ge $unit.Size) {
+            return ('{0:N2} {1}' -f ($ByteCount / $unit.Size), $unit.Name)
+        }
+    }
+}
+
+# 统一统计删除计划数量和预计可释放空间，供预览、-yes 和最终删除流程复用。
+function Get-DeletionPlanMetric {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DeletionPlanList
+    )
+
+    $plannedDeletionCount = 0
+    $plannedKeepCount = 0
+    $deletionItemList = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($deletionPlan in $DeletionPlanList) {
+        $plannedDeletionItems = @($deletionPlan.DeletionItems)
+        $plannedDeletionCount += $plannedDeletionItems.Count
+        $plannedKeepCount++
+        foreach ($plannedDeletionItem in $plannedDeletionItems) {
+            $deletionItemList.Add($plannedDeletionItem)
+        }
+    }
+
+    $reclaimableByteCount = Get-DeletionItemTotalByteCount -DeletionItemList $deletionItemList.ToArray()
+    return [pscustomobject]@{
+        GroupCount           = $DeletionPlanList.Count
+        KeepFileCount        = $plannedKeepCount
+        DeletionItemCount    = $plannedDeletionCount
+        ReclaimableByteCount = $reclaimableByteCount
+        ReclaimableSizeText  = Format-ByteSize -ByteCount $reclaimableByteCount
+    }
 }
 
 # 对已经生成的删除计划执行预览、默认删除、手动删除、跳过或退出。
@@ -1745,7 +1853,8 @@ function Invoke-DeletionPlanAction {
         [hashtable]$ManualDisplayPathByFullName
     )
 
-    if ($DeletionPlanList.Count -eq 0) {
+    $deletionPlanStatistics = Get-DeletionPlanMetric -DeletionPlanList $DeletionPlanList
+    if ($DeletionPlanList.Count -eq 0 -or $deletionPlanStatistics.DeletionItemCount -eq 0) {
         Write-Host $EmptyMessage -ForegroundColor Green
         return 'Continue'
     }

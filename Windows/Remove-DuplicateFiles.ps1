@@ -5,7 +5,7 @@
 
 参数：
   -h     显示帮助信息。
-  Path   一个或多个文件夹绝对路径。
+  Path   一个或多个文件夹绝对路径；未提供时会引导交互输入。
   -a     多目录合并模式，把多个目录抽象为一个大目录进行重复文件扫描。
   -c     参考目录模式，第一个目录为参考目录，其余目录为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
@@ -92,13 +92,11 @@ function Show-HelpText {
   查找重复文件，先预览，再选择删除或退出。
 
 用法：
-  pwsh -File .\Remove-DuplicateFiles.ps1 [-s] [-yes] [Path1] [Path2 ...]
-  pwsh -File .\Remove-DuplicateFiles.ps1 -a [-s] [-yes] <Path1> [Path2 ...]
-  pwsh -File .\Remove-DuplicateFiles.ps1 -c [-s] [-yes] <ReferencePath> <TargetPath1> [TargetPath2 ...]
-  pwsh -File .\Remove-DuplicateFiles.ps1 -h
+  pwsh -File .\Remove-DuplicateFiles.ps1 [-a] [-s] [-yes] [Path1] [Path2 ...]
+  pwsh -File .\Remove-DuplicateFiles.ps1 -c [-s] [-yes] [ReferencePath] [TargetPath1] [TargetPath2 ...]
 
 参数：
-  Path   文件夹绝对路径；不带 -a/-c 时，多个目录先全部扫描，再逐个操作。
+  Path   文件夹绝对路径；路径含空格请使用英文引号。
   -a     多目录合并模式，把多个目录视作一个大目录。
   -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
@@ -115,7 +113,7 @@ function Show-HelpText {
   单目录和多目录合并模式可默认删除、手动删除、跳过本次操作或退出。
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除、跳过本次操作或退出。
-  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请加引号。
+  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请使用英文引号。
 '@
 }
 
@@ -406,7 +404,7 @@ function Wait-AssumeYesDeletionGracePeriod {
     return $true
 }
 
-# 兼容交互输入时复制带首尾引号的路径；这里只移除成对包裹符号。
+# 兼容交互输入时复制带首尾英文引号的路径；这里只移除成对包裹符号。
 function ConvertTo-UnquotedPathText {
     param(
         [Parameter(Mandatory = $true)]
@@ -418,24 +416,17 @@ function ConvertTo-UnquotedPathText {
         return $normalizedPathText
     }
 
-    $quotePairs = @(
-        @{ Open = '"'; Close = '"' }
-        @{ Open = "'"; Close = "'" }
-        @{ Open = '“'; Close = '”' }
-        @{ Open = '‘'; Close = '’' }
-    )
-
-    foreach ($quotePair in $quotePairs) {
-        if ($normalizedPathText.StartsWith($quotePair.Open, [System.StringComparison]::Ordinal) -and
-            $normalizedPathText.EndsWith($quotePair.Close, [System.StringComparison]::Ordinal)) {
-            return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
-        }
+    $firstCharacterCode = [int][char]$normalizedPathText[0]
+    $lastCharacterCode = [int][char]$normalizedPathText[$normalizedPathText.Length - 1]
+    if (($firstCharacterCode -eq 34 -and $lastCharacterCode -eq 34) -or
+        ($firstCharacterCode -eq 39 -and $lastCharacterCode -eq 39)) {
+        return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
     }
 
     return $normalizedPathText
 }
 
-# 拆分交互输入的路径行：支持分号分隔，也支持在下一个片段看起来是绝对路径时按空格分隔。
+# 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段是绝对路径时按空格分隔。
 function Split-InteractivePathInput {
     param(
         [Parameter(Mandatory = $true)]
@@ -452,8 +443,6 @@ function Split-InteractivePathInput {
     $quoteCloseByOpen = @{}
     $quoteCloseByOpen.Add([string][char]34, [string][char]34)
     $quoteCloseByOpen.Add([string][char]39, [string][char]39)
-    $quoteCloseByOpen.Add([string][char]0x201C, [string][char]0x201D)
-    $quoteCloseByOpen.Add([string][char]0x2018, [string][char]0x2019)
     $activeClosingQuote = $null
 
     for ($index = 0; $index -lt $trimmedPathInput.Length; $index++) {
@@ -500,8 +489,6 @@ function Split-InteractivePathInput {
     $quoteStartPattern = @(
         [regex]::Escape([string][char]34)
         [regex]::Escape([string][char]39)
-        [regex]::Escape([string][char]0x201C)
-        [regex]::Escape([string][char]0x2018)
     ) -join '|'
     $absolutePathSeparatorPattern = '\s+(?=(?:' + $quoteStartPattern + ')?(?:[a-zA-Z]:[\\/]|[\\/]{2}))'
     foreach ($pathPart in $pathPartList) {
@@ -537,7 +524,7 @@ function Resolve-InputDirectory {
         $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
     }
     catch {
-        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格请加引号。原始错误: $($_.Exception.Message)"
+        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格请使用英文引号。原始错误: $($_.Exception.Message)"
     }
 
     if ($resolvedPaths.Count -ne 1) {
@@ -614,7 +601,7 @@ function Read-InteractivePathList {
     $inputPathList = [System.Collections.Generic.List[string]]::new()
     Write-Host "进入$ModePrompt。" -ForegroundColor Cyan
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请加引号。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {
@@ -654,7 +641,7 @@ function Read-InteractivePathList {
             $lineInputResult = Resolve-InteractivePathInputLine -PathInput $pathInput -StartIndex ($inputPathList.Count + 1)
         }
         catch {
-            Write-Host "输入无效，请重新输入存在的 Windows 文件夹绝对路径；路径含空格请加引号。" -ForegroundColor Yellow
+            Write-Host "输入无效，请重新输入存在的 Windows 文件夹绝对路径；路径含空格请使用英文引号。" -ForegroundColor Yellow
             continue
         }
 

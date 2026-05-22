@@ -677,10 +677,13 @@ EOF
             continue
         fi
 
+        local -i conversion_failed=0
+
         while (( enforce_size_limit == 0 || try_quality >= min_quality )); do
             if ! cwebp -quiet -q "$try_quality" "$source_for_convert" -o "$tmp_output"; then
                 msg_error "转换失败 \"$input_display\""
                 _common_remove_temp_file "$tmp_output" >/dev/null
+                conversion_failed=1
                 ((failed_count++))
                 break
             fi
@@ -696,6 +699,7 @@ EOF
                     fi
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    conversion_failed=1
                     ((failed_count++))
                 fi
                 break
@@ -707,6 +711,7 @@ EOF
                     msg_success "完成: \"$input_display\" -> \"$output_display\" (q=$try_quality, size=$((final_size/1024))KB${resize_note}${overwrite_note})"
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    conversion_failed=1
                     ((failed_count++))
                 fi
                 break
@@ -719,7 +724,7 @@ EOF
             ((try_quality-=quality_step))
         done
 
-        if (( converted == 0 )); then
+        if (( converted == 0 && conversion_failed == 0 )); then
             if [[ -f "$tmp_output" ]]; then
                 if _common_move_file "$tmp_output" "$output"; then
                     converted=1
@@ -731,9 +736,11 @@ EOF
                     fi
                 else
                     _common_remove_temp_file "$tmp_output" >/dev/null
+                    conversion_failed=1
                     ((failed_count++))
                 fi
             else
+                conversion_failed=1
                 ((failed_count++))
             fi
         fi

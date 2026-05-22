@@ -6,7 +6,7 @@
 参数：
   -h     显示帮助信息。
   -s     包含隐藏文件和隐藏文件夹。
-  Path   一个或多个文件或文件夹绝对路径。
+  Path   一个或多个文件或文件夹绝对路径；未提供时会引导交互输入。
 
 关键规则：
   默认保留原始文件。
@@ -31,7 +31,7 @@ param(
 # ========== 可调整配置 ==========
 
 # 转换完成后统一移动文件前的单文件等待时间，给 OneDrive 等同步目录留出短暂缓冲。
-$FileMoveDelayMilliseconds = 200
+$FileMoveDelayMilliseconds = 1000
 
 # 进度条宽度，统一使用 # 和 -，便于在 Windows/macOS 终端中保持可读。
 $ProgressBarCellCount = 32
@@ -81,12 +81,12 @@ function Show-HelpText {
   使用本机 Office 原生应用，将指定文件或文件夹下的 .doc、.xls、.ppt 转换为 .docx、.xlsx、.pptx。
 
 用法：
-  pwsh -File .\Convert-OfficeFiles.ps1 [-s] <Path1> [Path2 ...]
-  pwsh -File .\Convert-OfficeFiles.ps1 -h
+  pwsh -File .\Convert-OfficeFiles.ps1 [-s] [Path1] [Path2 ...]
 
 参数：
   Path
     一个或多个文件或文件夹绝对路径。文件路径会直接转换；文件夹路径会递归扫描。
+    未提供时会引导交互输入，交互时可在同一行输入多个路径；路径含空格请使用英文引号。
 
   -s
     包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
@@ -207,7 +207,7 @@ function Write-RefreshStatusLine {
     return 0
 }
 
-# 兼容用户复制路径时带上的英文或中文引号。
+# 兼容用户复制路径时带上的英文引号。
 function ConvertTo-UnquotedPathText {
     param(
         [Parameter(Mandatory = $true)]
@@ -219,21 +219,68 @@ function ConvertTo-UnquotedPathText {
         return $normalizedPathText
     }
 
-    $quotePairs = @(
-        @{ Open = '"'; Close = '"' }
-        @{ Open = "'"; Close = "'" }
-        @{ Open = '“'; Close = '”' }
-        @{ Open = '‘'; Close = '’' }
-    )
-
-    foreach ($quotePair in $quotePairs) {
-        if ($normalizedPathText.StartsWith($quotePair.Open, [System.StringComparison]::Ordinal) -and
-            $normalizedPathText.EndsWith($quotePair.Close, [System.StringComparison]::Ordinal)) {
-            return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
-        }
+    $firstCharacterCode = [int][char]$normalizedPathText[0]
+    $lastCharacterCode = [int][char]$normalizedPathText[$normalizedPathText.Length - 1]
+    if (($firstCharacterCode -eq 34 -and $lastCharacterCode -eq 34) -or
+        ($firstCharacterCode -eq 39 -and $lastCharacterCode -eq 39)) {
+        return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
     }
 
     return $normalizedPathText
+}
+
+# 将一行路径输入拆分为多个路径；英文引号只在路径片段开头生效，避免误伤路径中的撇号。
+function Split-InputPathLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InputText
+    )
+
+    $pathList = [System.Collections.Generic.List[string]]::new()
+    $builder = [System.Text.StringBuilder]::new()
+    $closingQuote = $null
+
+    foreach ($character in $InputText.ToCharArray()) {
+        if ($null -ne $closingQuote) {
+            if ($character -eq $closingQuote) {
+                $closingQuote = $null
+                continue
+            }
+
+            [void]$builder.Append($character)
+            continue
+        }
+
+        $characterCode = [int][char]$character
+
+        $canStartQuotedPath = $builder.Length -eq 0
+        if ($canStartQuotedPath -and $characterCode -eq 34) {
+            $closingQuote = [char]34
+            continue
+        }
+        elseif ($canStartQuotedPath -and $characterCode -eq 39) {
+            $closingQuote = [char]39
+            continue
+        }
+        if ([char]::IsWhiteSpace($character) -or $character -eq ';') {
+            $currentPath = ConvertTo-UnquotedPathText -PathText $builder.ToString()
+            if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
+                $pathList.Add($currentPath)
+            }
+
+            [void]$builder.Clear()
+            continue
+        }
+
+        [void]$builder.Append($character)
+    }
+
+    $lastPath = ConvertTo-UnquotedPathText -PathText $builder.ToString()
+    if (-not [string]::IsNullOrWhiteSpace($lastPath)) {
+        $pathList.Add($lastPath)
+    }
+
+    return $pathList.ToArray()
 }
 
 # 校验输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件或文件夹。
@@ -1002,15 +1049,25 @@ if ($Help) {
 }
 
 if ($null -eq $PathList -or $PathList.Count -eq 0) {
-    # 未传入路径时，引导用户输入一个文件或文件夹，直接回车则安全退出。
-    Write-Host "未提供 Path。请输入要转换的文件或要扫描的文件夹绝对路径；直接回车退出。" -ForegroundColor Yellow
+    # 未传入路径时，引导用户输入文件或文件夹，直接回车则安全退出。
+    Write-Host "请输入文件或目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
+    Write-Host "直接回车退出；输入 0 退出脚本。" -ForegroundColor DarkGray
     $pathInput = (Read-Host 'Path').Trim()
     if ([string]::IsNullOrWhiteSpace($pathInput)) {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
     }
 
-    $PathList = @($pathInput)
+    if ($pathInput -eq '0') {
+        Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+        exit 0
+    }
+
+    $PathList = @(Split-InputPathLine -InputText $pathInput)
+    if ($PathList.Count -gt 1) {
+        Write-Host "识别到 $($PathList.Count) 个路径。" -ForegroundColor DarkGray
+    }
 }
 
 try {

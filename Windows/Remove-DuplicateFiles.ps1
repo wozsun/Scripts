@@ -55,9 +55,6 @@ $ProgressBarFilledCharacter = '#'
 # 文本进度条未完成部分的字符。
 $ProgressBarEmptyCharacter = '-'
 
-# 倒计时状态结束后附加的清理空格数量，用于覆盖上一轮较长输出的尾巴。
-$ConsoleLineClearPadding = 20
-
 # 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
 $AssumeYesGraceSeconds = 10
 
@@ -70,6 +67,13 @@ Set-StrictMode -Version Latest
 
 # 遇到未处理异常时立即进入 catch/退出流程，避免继续执行危险操作。
 $ErrorActionPreference = 'Stop'
+
+# 加载 Windows 脚本公共工具函数。
+Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
+Set-ConsoleOutputConfig `
+    -ProgressBarCellCount $ProgressBarCellCount `
+    -ProgressBarFilledCharacter $ProgressBarFilledCharacter `
+    -ProgressBarEmptyCharacter $ProgressBarEmptyCharacter
 
 # ========== 参数派生选项 ==========
 
@@ -141,202 +145,6 @@ function Write-EnabledOptionNotice {
     }
 }
 
-# 输出当前执行阶段，避免大目录扫描时长时间无反馈。
-function Write-StageMessage {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
-
-    Write-Host "[进度] $Message" -ForegroundColor Cyan
-}
-
-# 估算字符在控制台中占用的单元格宽度；中文和全角字符通常占两格。
-function Get-ConsoleCharacterCellWidth {
-    param(
-        [Parameter(Mandatory = $true)]
-        [char]$Character
-    )
-
-    $codePoint = [int]$Character
-    if (
-        ($codePoint -ge 0x1100 -and $codePoint -le 0x115F) -or
-        ($codePoint -ge 0x2E80 -and $codePoint -le 0xA4CF) -or
-        ($codePoint -ge 0xAC00 -and $codePoint -le 0xD7A3) -or
-        ($codePoint -ge 0xF900 -and $codePoint -le 0xFAFF) -or
-        ($codePoint -ge 0xFE10 -and $codePoint -le 0xFE6F) -or
-        ($codePoint -ge 0xFF00 -and $codePoint -le 0xFF60) -or
-        ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)
-    ) {
-        return 2
-    }
-
-    return 1
-}
-
-# 将文本限制在指定控制台宽度内，避免动态进度行因过长而换行。
-function Get-ConsoleTextWithinCellWidth {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
-
-        [Parameter(Mandatory = $true)]
-        [int]$MaxCellWidth
-    )
-
-    $textBuilder = [System.Text.StringBuilder]::new()
-    $cellWidth = 0
-    foreach ($character in $Text.ToCharArray()) {
-        $characterWidth = Get-ConsoleCharacterCellWidth -Character $character
-        if (($cellWidth + $characterWidth) -gt $MaxCellWidth) {
-            break
-        }
-
-        [void]$textBuilder.Append($character)
-        $cellWidth += $characterWidth
-    }
-
-    return [pscustomobject]@{
-        Text      = $textBuilder.ToString()
-        CellWidth = $cellWidth
-    }
-}
-
-# 刷新单行动态状态：清理旧尾巴后把光标放回文本末尾，避免补空格导致光标漂移。
-function Write-DynamicStatusLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [Parameter(Mandatory = $true)]
-        [System.ConsoleColor]$Color
-    )
-
-    try {
-        if (-not [Console]::IsOutputRedirected) {
-            $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
-            $lineText = Get-ConsoleTextWithinCellWidth -Text $Message -MaxCellWidth $maxLineWidth
-
-            $cursorTop = [Console]::CursorTop
-            Write-Host -NoNewline "`r$($lineText.Text)" -ForegroundColor $Color
-            $remainingWidth = [Math]::Max(0, $maxLineWidth - $lineText.CellWidth)
-            if ($remainingWidth -gt 0) {
-                Write-Host -NoNewline (' ' * $remainingWidth)
-                [Console]::SetCursorPosition($lineText.CellWidth, $cursorTop)
-            }
-            return
-        }
-    }
-    catch {
-        # 部分宿主不支持读取控制台宽度，回退为普通回车刷新。
-        Write-Debug "动态状态行刷新已回退: $($_.Exception.Message)"
-    }
-
-    Write-Host -NoNewline "`r$Message" -ForegroundColor $Color
-}
-
-# 更新百分比进度条；使用普通文本单行刷新，避免 Write-Progress 改变控制台背景色。
-function Write-ProgressBar {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Activity,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Status,
-
-        [Parameter(Mandatory = $true)]
-        [int]$ProcessedCount,
-
-        [Parameter(Mandatory = $true)]
-        [int]$TotalCount,
-
-        [Parameter(Mandatory = $true)]
-        [ref]$LastPercent
-    )
-
-    if ($TotalCount -le 0) {
-        return
-    }
-
-    $percent = [Math]::Min(100, [int][Math]::Floor(($ProcessedCount / $TotalCount) * 100))
-    if ($percent -eq $LastPercent.Value) {
-        return
-    }
-
-    $filledWidth = [Math]::Floor(($percent / 100) * $ProgressBarCellCount)
-    $emptyWidth = $ProgressBarCellCount - $filledWidth
-    $bar = ($ProgressBarFilledCharacter * $filledWidth) + ($ProgressBarEmptyCharacter * $emptyWidth)
-    $progressText = "[进度] $Activity [$bar] $percent% $Status ($ProcessedCount / $TotalCount)"
-
-    Write-DynamicStatusLine -Message $progressText -Color Cyan
-    $LastPercent.Value = $percent
-}
-
-# 结束当前进度条并换行，避免后续日志和动态进度混在一起。
-function Complete-ProgressBar {
-    Write-Host ""
-}
-
-# 新建延迟输出的扫描警告列表，避免进度条刷新时被错误信息打断。
-function New-DeferredScanWarningList {
-    $warningList = [System.Collections.Generic.List[object]]::new()
-    return , $warningList
-}
-
-# 记录扫描或哈希阶段的可跳过错误；未传入列表时退化为立即输出。
-function Add-DeferredScanWarning {
-    param(
-        [Parameter(Mandatory = $false)]
-        [System.Collections.Generic.List[object]]$WarningList,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Reason
-    )
-
-    if ($null -eq $WarningList) {
-        Write-Host "$($Message): $Path" -ForegroundColor Yellow
-        Write-Host "  原因: $Reason" -ForegroundColor DarkGray
-        return
-    }
-
-    $WarningList.Add([pscustomobject]@{
-            Message = $Message
-            Path    = $Path
-            Reason  = $Reason
-        })
-}
-
-# 在当前进度段结束后统一输出扫描警告，保持动态进度条单行刷新。
-function Write-DeferredScanWarningList {
-    param(
-        [Parameter(Mandatory = $false)]
-        [System.Collections.Generic.List[object]]$WarningList,
-
-        [Parameter(Mandatory = $false)]
-        [string]$Title = '扫描跳过汇总'
-    )
-
-    if ($null -eq $WarningList -or $WarningList.Count -eq 0) {
-        return
-    }
-
-    Write-Host "$($Title): $($WarningList.Count)" -ForegroundColor Yellow
-    foreach ($warning in $WarningList) {
-        Write-Host "$($warning.Message): $($warning.Path)" -ForegroundColor Yellow
-        Write-Host "  原因: $($warning.Reason)" -ForegroundColor DarkGray
-    }
-}
-
 # 输出用于区分不同预览或结果块的分隔线。
 function Write-PreviewSeparator {
     Write-Host ""
@@ -386,13 +194,14 @@ function Wait-AssumeYesDeletionGracePeriod {
     Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
 
     for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-Host -NoNewline "`r倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -ForegroundColor Yellow
+        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
 
         $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $AssumeYesInputPollIntervalMilliseconds))
         for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
             if (Test-EnterKeyPressed) {
                 $script:AssumeYesDeletionCancelled = $true
-                Write-Host "`r已取消 -yes 默认删除，未删除任何文件。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Yellow
+                Write-DynamicStatusLine -Message '已取消 -yes 默认删除，未删除任何文件。' -Color Yellow
+                Write-Host ""
                 return $false
             }
 
@@ -400,107 +209,9 @@ function Wait-AssumeYesDeletionGracePeriod {
         }
     }
 
-    Write-Host "`r倒计时结束，开始执行默认删除。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Magenta
+    Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
+    Write-Host ""
     return $true
-}
-
-# 兼容交互输入时复制带首尾英文引号的路径；这里只移除成对包裹符号。
-function ConvertTo-UnquotedPathText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PathText
-    )
-
-    $normalizedPathText = $PathText.Trim()
-    if ($normalizedPathText.Length -lt 2) {
-        return $normalizedPathText
-    }
-
-    $firstCharacterCode = [int][char]$normalizedPathText[0]
-    $lastCharacterCode = [int][char]$normalizedPathText[$normalizedPathText.Length - 1]
-    if (($firstCharacterCode -eq 34 -and $lastCharacterCode -eq 34) -or
-        ($firstCharacterCode -eq 39 -and $lastCharacterCode -eq 39)) {
-        return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
-    }
-
-    return $normalizedPathText
-}
-
-# 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段是绝对路径时按空格分隔。
-function Split-InteractivePathInput {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PathInput
-    )
-
-    $trimmedPathInput = $PathInput.Trim()
-    if ([string]::IsNullOrWhiteSpace($trimmedPathInput)) {
-        return @()
-    }
-
-    $pathPartList = [System.Collections.Generic.List[string]]::new()
-    $currentInputPart = [System.Text.StringBuilder]::new()
-    $quoteCloseByOpen = @{}
-    $quoteCloseByOpen.Add([string][char]34, [string][char]34)
-    $quoteCloseByOpen.Add([string][char]39, [string][char]39)
-    $activeClosingQuote = $null
-
-    for ($index = 0; $index -lt $trimmedPathInput.Length; $index++) {
-        $currentChar = $trimmedPathInput[$index].ToString()
-
-        if ($null -ne $activeClosingQuote) {
-            [void]$currentInputPart.Append($currentChar)
-            if ($currentChar -eq $activeClosingQuote) {
-                $activeClosingQuote = $null
-            }
-            continue
-        }
-
-        $currentInputText = $currentInputPart.ToString()
-        $canStartQuotedPath = [string]::IsNullOrWhiteSpace($currentInputText)
-        if (-not $canStartQuotedPath) {
-            $canStartQuotedPath = [char]::IsWhiteSpace($currentInputText[$currentInputText.Length - 1])
-        }
-
-        if ($canStartQuotedPath -and $quoteCloseByOpen.ContainsKey($currentChar)) {
-            $activeClosingQuote = $quoteCloseByOpen[$currentChar]
-            [void]$currentInputPart.Append($currentChar)
-            continue
-        }
-
-        if ($currentChar -eq ';') {
-            $pathPart = $currentInputPart.ToString().Trim()
-            if (-not [string]::IsNullOrWhiteSpace($pathPart)) {
-                $pathPartList.Add($pathPart)
-            }
-            [void]$currentInputPart.Clear()
-            continue
-        }
-
-        [void]$currentInputPart.Append($currentChar)
-    }
-
-    $lastPathPart = $currentInputPart.ToString().Trim()
-    if (-not [string]::IsNullOrWhiteSpace($lastPathPart)) {
-        $pathPartList.Add($lastPathPart)
-    }
-
-    $resultPathList = [System.Collections.Generic.List[string]]::new()
-    $quoteStartPattern = @(
-        [regex]::Escape([string][char]34)
-        [regex]::Escape([string][char]39)
-    ) -join '|'
-    $absolutePathSeparatorPattern = '\s+(?=(?:' + $quoteStartPattern + ')?(?:[a-zA-Z]:[\\/]|[\\/]{2}))'
-    foreach ($pathPart in $pathPartList) {
-        foreach ($pathSegment in [regex]::Split($pathPart, $absolutePathSeparatorPattern)) {
-            $trimmedPathSegment = $pathSegment.Trim()
-            if (-not [string]::IsNullOrWhiteSpace($trimmedPathSegment)) {
-                $resultPathList.Add($trimmedPathSegment)
-            }
-        }
-    }
-
-    return $resultPathList.ToArray()
 }
 
 # 校验输入路径是否为存在的 Windows 绝对目录，并返回规范化后的完整路径。
@@ -664,31 +375,6 @@ function Read-InteractivePathList {
             Write-Host "识别到 $($lineInputResult.InputCount) 个路径。" -ForegroundColor DarkGray
         }
     }
-}
-
-# 将目录路径标准化为便于比较的形式，用于目录重叠检查。
-function ConvertTo-NormalizedDirectoryPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    return [System.IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
-}
-
-# 给目录路径追加结尾分隔符，避免 C:\A 和 C:\AB 这种前缀误判。
-function Add-TrailingDirectorySeparator {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if ($Path.EndsWith('\', [System.StringComparison]::Ordinal) -or
-        $Path.EndsWith('/', [System.StringComparison]::Ordinal)) {
-        return $Path
-    }
-
-    return "$Path\"
 }
 
 # 同一次扫描中的目录必须互不包含，避免同一文件被重复扫描或重复处理。
@@ -1135,7 +821,7 @@ function Write-DeletionPlanSummary {
         [string]$SummaryMessageTemplate
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanSummary -DeletionPlanList $DeletionPlanList
     $plannedDeletionCount = $deletionPlanStatistics.DeletionItemCount
 
     Write-Host ""
@@ -1560,7 +1246,7 @@ function New-MergedDirectoryDeletionPlan {
             })
         }
     }
-    Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
+    Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent) -Force
     Complete-ProgressBar
     Write-DeferredScanWarningList -WarningList $mergedScanWarningList -Title '合并目录扫描跳过汇总'
     Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
@@ -1753,7 +1439,7 @@ function Format-ByteSize {
 }
 
 # 统一统计删除计划数量和预计可释放空间，供预览、-yes 和最终删除流程复用。
-function Get-DeletionPlanStatistics {
+function Get-DeletionPlanSummary {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
@@ -1812,7 +1498,7 @@ function Invoke-DeletionPlanAction {
         [hashtable]$ManualDisplayPathByFullName
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanSummary -DeletionPlanList $DeletionPlanList
     if ($DeletionPlanList.Count -eq 0 -or $deletionPlanStatistics.DeletionItemCount -eq 0) {
         Write-Host $EmptyMessage -ForegroundColor Green
         return 'Continue'

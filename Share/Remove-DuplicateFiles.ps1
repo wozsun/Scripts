@@ -59,9 +59,6 @@ $ProgressBarFilledCharacter = '#'
 # 文本进度条未完成部分的字符。
 $ProgressBarEmptyCharacter = '-'
 
-# 倒计时状态结束后附加的清理空格数量，用于覆盖上一轮较长输出的尾巴。
-$ConsoleLineClearPadding = 20
-
 # 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
 $AssumeYesGraceSeconds = 10
 
@@ -96,8 +93,8 @@ function Show-HelpText {
   查找重复文件，先预览，再选择删除或退出。
 
 用法：
-  powershell -File .\Remove-DuplicateFiles-PS5.ps1 [-a] [-s] [-yes] [Path1] [Path2 ...]
-  powershell -File .\Remove-DuplicateFiles-PS5.ps1 -c [-s] [-yes] [ReferencePath] [TargetPath1] [TargetPath2 ...]
+  powershell -File .\Remove-DuplicateFiles.ps1 [-a] [-s] [-yes] [Path1] [Path2 ...]
+  powershell -File .\Remove-DuplicateFiles.ps1 -c [-s] [-yes] [ReferencePath] [TargetPath1] [TargetPath2 ...]
 
 参数：
   Path   文件夹绝对路径；路径含空格请使用英文引号。
@@ -255,7 +252,10 @@ function Write-ProgressBar {
         [int]$TotalCount,
 
         [Parameter(Mandatory = $true)]
-        [ref]$LastPercent
+        [ref]$LastPercent,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
     )
 
     if ($TotalCount -le 0) {
@@ -263,7 +263,7 @@ function Write-ProgressBar {
     }
 
     $percent = [Math]::Min(100, [int][Math]::Floor(($ProcessedCount / $TotalCount) * 100))
-    if ($percent -eq $LastPercent.Value) {
+    if (-not $Force -and $percent -eq $LastPercent.Value) {
         return
     }
 
@@ -390,13 +390,14 @@ function Wait-AssumeYesDeletionGracePeriod {
     Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
 
     for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-Host -NoNewline "`r倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -ForegroundColor Yellow
+        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
 
         $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $AssumeYesInputPollIntervalMilliseconds))
         for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
             if (Test-EnterKeyPressed) {
                 $script:AssumeYesDeletionCancelled = $true
-                Write-Host "`r已取消 -yes 默认删除，未删除任何文件。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Yellow
+                Write-DynamicStatusLine -Message '已取消 -yes 默认删除，未删除任何文件。' -Color Yellow
+                Write-Host ""
                 return $false
             }
 
@@ -404,7 +405,8 @@ function Wait-AssumeYesDeletionGracePeriod {
         }
     }
 
-    Write-Host "`r倒计时结束，开始执行默认删除。$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Magenta
+    Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
+    Write-Host ""
     return $true
 }
 
@@ -1163,7 +1165,7 @@ function Write-DeletionPlanSummary {
         [string]$SummaryMessageTemplate
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanSummary -DeletionPlanList $DeletionPlanList
     $plannedDeletionCount = $deletionPlanStatistics.DeletionItemCount
 
     Write-Host ""
@@ -1588,7 +1590,7 @@ function New-MergedDirectoryDeletionPlan {
             })
         }
     }
-    Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent)
+    Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent) -Force
     Complete-ProgressBar
     Write-DeferredScanWarningList -WarningList $mergedScanWarningList -Title '合并目录扫描跳过汇总'
     Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
@@ -1781,7 +1783,7 @@ function Format-ByteSize {
 }
 
 # 统一统计删除计划数量和预计可释放空间，供预览、-yes 和最终删除流程复用。
-function Get-DeletionPlanStatistics {
+function Get-DeletionPlanSummary {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
@@ -1840,7 +1842,7 @@ function Invoke-DeletionPlanAction {
         [hashtable]$ManualDisplayPathByFullName
     )
 
-    $deletionPlanStatistics = Get-DeletionPlanStatistics -DeletionPlanList $DeletionPlanList
+    $deletionPlanStatistics = Get-DeletionPlanSummary -DeletionPlanList $DeletionPlanList
     if ($DeletionPlanList.Count -eq 0 -or $deletionPlanStatistics.DeletionItemCount -eq 0) {
         Write-Host $EmptyMessage -ForegroundColor Green
         return 'Continue'

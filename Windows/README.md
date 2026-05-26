@@ -1,6 +1,8 @@
 # Windows 脚本
 
-这个文件夹用于存放 Windows 平台可用的 PowerShell 脚本。
+这个文件夹用于存放 Windows 平台可用的 PowerShell 7 脚本。
+
+`common.psm1` 是本目录脚本共用的工具模块，提供动态进度条、延迟警告输出、路径输入解析等公共能力。直接运行本目录脚本时请保留 `common.psm1` 和脚本在同一目录下；需要单文件分享时使用仓库 `Share` 目录中的共享脚本。
 
 ## Convert-OfficeFiles.ps1
 
@@ -133,7 +135,7 @@ pwsh -File .\Remove-DuplicateFiles.ps1 -c "C:\Path\Reference" "C:\Path\TargetA" 
 - 除 `-yes` 外，删除前会先显示详细预览；预览和删除摘要会显示计划删除数量以及预计可释放空间。`-yes` 会输出汇总后进入倒计时；没有可删除项时会直接跳过。单目录和多目录合并模式提供 `默认删除 / 手动删除 / 跳过本次操作 / 退出脚本`，参考目录模式提供 `默认删除 / 跳过本次操作 / 退出脚本`。多个单目录逐个操作时，`0` 表示跳过当前目录，`00` 表示退出脚本。
 - 默认保留规则：同一目录内优先保留文件名更短的文件；不同目录之间优先保留父目录中的文件；不属于父子目录时，优先保留目录层级更少的文件；目录层级相同时，优先保留目录路径更短的文件；仍相同时按文件名和完整路径排序。
 - 删除使用 `Remove-Item`，不会进入回收站；扫描、哈希或删除失败时会提示并继续处理后续文件。
-- `Remove-DuplicateFiles-PS5.ps1` 是 PowerShell 5.1 兼容副本，使用 UTF-8 with BOM 保存；允许脚本执行可运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
+- 仓库 `Share\Remove-DuplicateFiles.ps1` 是 PowerShell 5.1 兼容共享版，保留完整单文件实现；允许脚本执行可运行 `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned`。
 
 ### 哈希策略
 

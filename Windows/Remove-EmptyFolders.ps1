@@ -41,6 +41,10 @@ $YesCountdownSeconds = 10
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# 加载 Windows 脚本公共工具函数。
+Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
+Set-ConsoleOutputConfig -ProgressBarCellCount $ProgressBarWidth
+
 # 是否把隐藏文件夹也作为可删除候选；空目录判断始终会检查隐藏和系统项。
 $IncludeHiddenFolderCandidates = [bool]$s
 
@@ -67,239 +71,6 @@ function Show-HelpText {
 '@
 }
 
-# 输出阶段信息。
-function Write-StageMessage {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
-
-    Write-Host "[进度] $Message" -ForegroundColor Cyan
-}
-
-# 输出菜单项，保持菜单编号醒目。
-function Write-MenuItem {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Number,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Text
-    )
-
-    Write-Host -NoNewline "  $Number " -ForegroundColor Cyan
-    Write-Host $Text -ForegroundColor White
-}
-
-# 输出彩色输入提示并读取一行文本。
-function Read-ColoredLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Prompt
-    )
-
-    Write-Host -NoNewline $Prompt -ForegroundColor Cyan
-    return [Console]::ReadLine()
-}
-
-# 输出单行动态进度条。
-function Write-ProgressLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Activity,
-
-        [Parameter(Mandatory = $true)]
-        [int]$Current,
-
-        [Parameter(Mandatory = $true)]
-        [int]$Total,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Status,
-
-        [switch]$Force
-    )
-
-    if ($Total -le 0) {
-        return
-    }
-
-    $percent = [int][Math]::Floor(($Current / $Total) * 100)
-    $stateKey = "ProgressPercent:$Activity"
-    $previousPercent = if (Test-Path -LiteralPath "variable:script:$stateKey") {
-        Get-Variable -Name $stateKey -Scope Script -ValueOnly
-    }
-    else {
-        $null
-    }
-
-    if (-not $Force -and $null -ne $previousPercent -and $previousPercent -eq $percent) {
-        return
-    }
-
-    Set-Variable -Name $stateKey -Scope Script -Value $percent
-
-    $filledWidth = if ($percent -ge 100) {
-        $ProgressBarWidth
-    }
-    else {
-        [int][Math]::Floor($ProgressBarWidth * $percent / 100)
-    }
-    $emptyWidth = $ProgressBarWidth - $filledWidth
-    $bar = ('#' * $filledWidth) + ('-' * $emptyWidth)
-    $line = "[进度] $Activity [$bar] $percent% $Status ($Current / $Total)"
-
-    Write-Host -NoNewline "`r$line" -ForegroundColor Cyan
-}
-
-# 结束单行进度条，避免后续输出和进度行混在一起。
-function Complete-ProgressLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Activity
-    )
-
-    $stateKey = "ProgressPercent:$Activity"
-    if (Test-Path -LiteralPath "variable:script:$stateKey") {
-        Remove-Variable -Name $stateKey -Scope Script -Force
-    }
-
-    Write-Host
-}
-
-# 去掉路径两端的英文引号。
-function ConvertTo-UnquotedPathText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text
-    )
-
-    $trimmedText = $Text.Trim()
-    if ($trimmedText.Length -ge 2) {
-        $firstCharacterCode = [int][char]$trimmedText[0]
-        $lastCharacterCode = [int][char]$trimmedText[$trimmedText.Length - 1]
-        if (($firstCharacterCode -eq 34 -and $lastCharacterCode -eq 34) -or
-            ($firstCharacterCode -eq 39 -and $lastCharacterCode -eq 39)) {
-            return $trimmedText.Substring(1, $trimmedText.Length - 2).Trim()
-        }
-    }
-
-    return $trimmedText
-}
-
-# 将一行路径输入拆分为多个路径；英文引号只在路径片段开头生效，避免误伤路径中的撇号。
-function Split-InputPathLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$InputText
-    )
-
-    $pathList = [System.Collections.Generic.List[string]]::new()
-    $builder = [System.Text.StringBuilder]::new()
-    $closingQuote = $null
-
-    foreach ($character in $InputText.ToCharArray()) {
-        if ($null -ne $closingQuote) {
-            if ($character -eq $closingQuote) {
-                $closingQuote = $null
-                continue
-            }
-
-            [void]$builder.Append($character)
-            continue
-        }
-
-        $characterCode = [int][char]$character
-
-        $canStartQuotedPath = $builder.Length -eq 0
-        if ($canStartQuotedPath -and $characterCode -eq 34) {
-            $closingQuote = [char]34
-            continue
-        }
-        elseif ($canStartQuotedPath -and $characterCode -eq 39) {
-            $closingQuote = [char]39
-            continue
-        }
-        if ([char]::IsWhiteSpace($character) -or $character -eq ';') {
-            $currentPath = ConvertTo-UnquotedPathText -Text $builder.ToString()
-            if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
-                $pathList.Add($currentPath)
-            }
-
-            [void]$builder.Clear()
-            continue
-        }
-
-        [void]$builder.Append($character)
-    }
-
-    $lastPath = ConvertTo-UnquotedPathText -Text $builder.ToString()
-    if (-not [string]::IsNullOrWhiteSpace($lastPath)) {
-        $pathList.Add($lastPath)
-    }
-
-    return $pathList.ToArray()
-}
-
-# 生成用于比较的目录键，统一去除尾部分隔符。
-function Get-DirectoryKey {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DirectoryPath
-    )
-
-    return [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($DirectoryPath))
-}
-
-# 给目录路径追加结尾分隔符，避免 C:\A 和 C:\AB 这种前缀误判；根目录已带分隔符时不再重复追加。
-function Add-TrailingDirectorySeparator {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DirectoryPath
-    )
-
-    if ($DirectoryPath.EndsWith('\', [System.StringComparison]::Ordinal) -or
-        $DirectoryPath.EndsWith('/', [System.StringComparison]::Ordinal)) {
-        return $DirectoryPath
-    }
-
-    return "$DirectoryPath$([System.IO.Path]::DirectorySeparatorChar)"
-}
-
-# 计算目录路径层级，用于从深到浅处理目录。
-function Get-DirectoryPathDepth {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DirectoryPath
-    )
-
-    return ((Get-DirectoryKey -DirectoryPath $DirectoryPath) -split '[\\/]').Count
-}
-
-# 判断两个目录是否相同或互相包含。
-function Test-DirectoryOverlap {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$LeftPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RightPath
-    )
-
-    $leftKey = Get-DirectoryKey -DirectoryPath $LeftPath
-    $rightKey = Get-DirectoryKey -DirectoryPath $RightPath
-
-    if ($leftKey.Equals($rightKey, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $true
-    }
-
-    $leftPrefix = Add-TrailingDirectorySeparator -DirectoryPath $leftKey
-    $rightPrefix = Add-TrailingDirectorySeparator -DirectoryPath $rightKey
-
-    return ($leftPrefix.StartsWith($rightPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $rightPrefix.StartsWith($leftPrefix, [System.StringComparison]::OrdinalIgnoreCase))
-}
-
 # 校验并解析单个输入目录。
 function Resolve-InputDirectory {
     param(
@@ -307,7 +78,7 @@ function Resolve-InputDirectory {
         [string]$RawPath
     )
 
-    $cleanPath = ConvertTo-UnquotedPathText -Text $RawPath
+    $cleanPath = ConvertTo-UnquotedPathText -PathText $RawPath
     if ([string]::IsNullOrWhiteSpace($cleanPath)) {
         return [pscustomobject]@{
             Success = $false
@@ -435,7 +206,7 @@ function Read-InteractiveDirectoryList {
             exit 0
         }
 
-        $rawPathList = @(Split-InputPathLine -InputText $inputLine)
+        $rawPathList = @(Split-InteractivePathInput -PathInput $inputLine)
         if ($rawPathList.Count -eq 0) {
             Write-Host "输入无效，请重新输入目录绝对路径。" -ForegroundColor Red
             continue
@@ -557,9 +328,10 @@ function New-EmptyFolderDeletionPlan {
 
     $activity = '空文件夹判断'
     $currentIndex = 0
+    $lastFolderCheckPercent = -1
     foreach ($directory in $sortedDirectoryList) {
         $currentIndex++
-        Write-ProgressLine -Activity $activity -Current $currentIndex -Total $sortedDirectoryList.Count -Status '正在判断空文件夹'
+        Write-ProgressBar -Activity $activity -Status '正在判断空文件夹' -ProcessedCount $currentIndex -TotalCount $sortedDirectoryList.Count -LastPercent ([ref]$lastFolderCheckPercent)
 
         if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             continue
@@ -572,8 +344,8 @@ function New-EmptyFolderDeletionPlan {
             }
         }
     }
-    Write-ProgressLine -Activity $activity -Current $sortedDirectoryList.Count -Total $sortedDirectoryList.Count -Status '空文件夹判断完成' -Force
-    Complete-ProgressLine -Activity $activity
+    Write-ProgressBar -Activity $activity -Status '空文件夹判断完成' -ProcessedCount $sortedDirectoryList.Count -TotalCount $sortedDirectoryList.Count -LastPercent ([ref]$lastFolderCheckPercent) -Force
+    Complete-ProgressBar
 
     return [pscustomobject]@{
         Items  = $plannedDirectoryList.ToArray()
@@ -591,12 +363,17 @@ function Write-ErrorRecordList {
         return
     }
 
-    Write-Host
-    Write-Host "扫描或判断过程中有 $($ErrorRecordList.Count) 项失败，已跳过相关目录:" -ForegroundColor Yellow
+    $warningList = New-DeferredScanWarningList
     foreach ($errorRecord in $ErrorRecordList) {
-        Write-Host "  [$($errorRecord.Stage)] $($errorRecord.Path)" -ForegroundColor Red
-        Write-Host "    原因: $($errorRecord.Message)" -ForegroundColor DarkGray
+        Add-DeferredScanWarning `
+            -WarningList $warningList `
+            -Message "[$($errorRecord.Stage)] 跳过目录" `
+            -Path $errorRecord.Path `
+            -Reason $errorRecord.Message
     }
+
+    Write-Host
+    Write-DeferredScanWarningList -WarningList $warningList -Title '空文件夹扫描跳过汇总'
 }
 
 # 输出删除预览。
@@ -713,7 +490,7 @@ function Wait-DefaultDeletionCountdown {
     Write-Host "计划删除空文件夹数: $DeletionCount" -ForegroundColor Yellow
 
     for ($remainingSeconds = $YesCountdownSeconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-Host -NoNewline "`r$remainingSeconds 秒后开始删除；按 Enter 取消。" -ForegroundColor Yellow
+        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
 
         $deadline = (Get-Date).AddSeconds(1)
         while ((Get-Date) -lt $deadline) {
@@ -721,15 +498,15 @@ function Wait-DefaultDeletionCountdown {
                 if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
                     $key = [Console]::ReadKey($true)
                     if ($key.Key -eq [ConsoleKey]::Enter) {
-                        Write-Host
-                        Write-Host "已取消默认删除。" -ForegroundColor Yellow
+                        Write-DynamicStatusLine -Message '已取消默认删除。' -Color Yellow
+                        Write-Host ""
                         return $false
                     }
                 }
             }
             catch {
                 Start-Sleep -Seconds $remainingSeconds
-                Write-Host
+                Write-Host ""
                 return $true
             }
 
@@ -737,7 +514,8 @@ function Wait-DefaultDeletionCountdown {
         }
     }
 
-    Write-Host
+    Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
+    Write-Host ""
     return $true
 }
 
@@ -762,10 +540,11 @@ function Invoke-EmptyFolderDeletion {
 
     $activity = '空文件夹删除'
     $currentIndex = 0
+    $lastDeletionPercent = -1
 
     foreach ($targetDirectory in $orderedTargetList) {
         $currentIndex++
-        Write-ProgressLine -Activity $activity -Current $currentIndex -Total $orderedTargetList.Count -Status '正在删除空文件夹'
+        Write-ProgressBar -Activity $activity -Status '正在删除空文件夹' -ProcessedCount $currentIndex -TotalCount $orderedTargetList.Count -LastPercent ([ref]$lastDeletionPercent)
 
         if (-not (Test-Path -LiteralPath $targetDirectory.FullName -PathType Container)) {
             $skippedList.Add([pscustomobject]@{
@@ -796,8 +575,8 @@ function Invoke-EmptyFolderDeletion {
         }
     }
 
-    Write-ProgressLine -Activity $activity -Current $orderedTargetList.Count -Total $orderedTargetList.Count -Status '空文件夹删除完成' -Force
-    Complete-ProgressLine -Activity $activity
+    Write-ProgressBar -Activity $activity -Status '空文件夹删除完成' -ProcessedCount $orderedTargetList.Count -TotalCount $orderedTargetList.Count -LastPercent ([ref]$lastDeletionPercent) -Force
+    Complete-ProgressBar
 
     if ($deletedList.Count -gt 0) {
         Write-Host

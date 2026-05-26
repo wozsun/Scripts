@@ -36,9 +36,6 @@ $FileMoveDelayMilliseconds = 1000
 # 进度条宽度，统一使用 # 和 -，便于在 Windows/macOS 终端中保持可读。
 $ProgressBarCellCount = 32
 
-# 单行刷新时尾部额外清理空格数，避免较长旧内容残留在行尾。
-$ConsoleLineClearPadding = 20
-
 # 输入根目录下的脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
 $TempRootDirectoryName = '.convert-officefiles-tmp'
 
@@ -68,6 +65,10 @@ Set-StrictMode -Version Latest
 
 # 遇到未处理异常时立即进入 catch/退出流程，避免后续步骤继续处理不完整状态。
 $ErrorActionPreference = 'Stop'
+
+# 加载 Windows 脚本公共工具函数。
+Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
+Set-ConsoleOutputConfig -ProgressBarCellCount $ProgressBarCellCount
 
 # ========== 参数派生选项 ==========
 
@@ -99,188 +100,6 @@ function Show-HelpText {
   脚本会先转换到该专属临时文件夹，退出 Office 后再统一移动到目标位置。
   每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 '@
-}
-
-# 输出阶段性进度信息，避免普通转换结果和扫描状态混在一起。
-function Write-StageMessage {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
-
-    Write-Host "[进度] $Message" -ForegroundColor Cyan
-}
-
-# 输出单行动态进度条，只在百分比变化时刷新，减少终端滚屏。
-function Write-ProgressBar {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Activity,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Status,
-
-        [Parameter(Mandatory = $true)]
-        [int]$ProcessedCount,
-
-        [Parameter(Mandatory = $true)]
-        [int]$TotalCount,
-
-        [Parameter(Mandatory = $true)]
-        [ref]$LastPercent
-    )
-
-    if ($TotalCount -le 0) {
-        return
-    }
-
-    $percent = [Math]::Min(100, [int][Math]::Floor(($ProcessedCount / $TotalCount) * 100))
-    if ($percent -eq $LastPercent.Value) {
-        return
-    }
-
-    $filledWidth = [Math]::Floor(($percent / 100) * $ProgressBarCellCount)
-    $emptyWidth = $ProgressBarCellCount - $filledWidth
-    $bar = ('#' * $filledWidth) + ('-' * $emptyWidth)
-    $progressText = "[进度] $Activity [$bar] $percent% $Status ($ProcessedCount / $TotalCount)"
-
-    Write-Host -NoNewline "`r$progressText$(' ' * $ConsoleLineClearPadding)" -ForegroundColor Cyan
-    $LastPercent.Value = $percent
-}
-
-# 进度条使用回车刷新，结束后补一个换行，避免后续输出接在同一行。
-function Complete-ProgressBar {
-    Write-Host ""
-}
-
-# 估算控制台显示宽度，中文等宽字符按 2 格计算，用于同一行刷新时清理残留文本。
-function Get-ConsoleTextWidth {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text
-    )
-
-    $width = 0
-    foreach ($character in $Text.ToCharArray()) {
-        if ([int]$character -le 0x00FF) {
-            $width++
-        }
-        else {
-            $width += 2
-        }
-    }
-
-    return $width
-}
-
-# 使用同一行刷新状态，避免“正在转换”和“转换完成”输出成两行。
-function Write-RefreshStatusLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [Parameter(Mandatory = $true)]
-        [System.ConsoleColor]$Color,
-
-        [Parameter(Mandatory = $false)]
-        [int]$PreviousLength = 0,
-
-        [Parameter(Mandatory = $false)]
-        [switch]$NoNewLine
-    )
-
-    $messageWidth = Get-ConsoleTextWidth -Text $Message
-    $paddingLength = if ($NoNewLine -and $PreviousLength -le 0) {
-        0
-    }
-    else {
-        [Math]::Max(20, $PreviousLength - $messageWidth + 20)
-    }
-    $outputText = "`r$Message$(' ' * $paddingLength)"
-
-    if ($NoNewLine) {
-        Write-Host -NoNewline $outputText -ForegroundColor $Color
-        return $messageWidth
-    }
-
-    Write-Host $outputText -ForegroundColor $Color
-    return 0
-}
-
-# 兼容用户复制路径时带上的英文引号。
-function ConvertTo-UnquotedPathText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PathText
-    )
-
-    $normalizedPathText = $PathText.Trim()
-    if ($normalizedPathText.Length -lt 2) {
-        return $normalizedPathText
-    }
-
-    $firstCharacterCode = [int][char]$normalizedPathText[0]
-    $lastCharacterCode = [int][char]$normalizedPathText[$normalizedPathText.Length - 1]
-    if (($firstCharacterCode -eq 34 -and $lastCharacterCode -eq 34) -or
-        ($firstCharacterCode -eq 39 -and $lastCharacterCode -eq 39)) {
-        return $normalizedPathText.Substring(1, $normalizedPathText.Length - 2).Trim()
-    }
-
-    return $normalizedPathText
-}
-
-# 将一行路径输入拆分为多个路径；英文引号只在路径片段开头生效，避免误伤路径中的撇号。
-function Split-InputPathLine {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$InputText
-    )
-
-    $pathList = [System.Collections.Generic.List[string]]::new()
-    $builder = [System.Text.StringBuilder]::new()
-    $closingQuote = $null
-
-    foreach ($character in $InputText.ToCharArray()) {
-        if ($null -ne $closingQuote) {
-            if ($character -eq $closingQuote) {
-                $closingQuote = $null
-                continue
-            }
-
-            [void]$builder.Append($character)
-            continue
-        }
-
-        $characterCode = [int][char]$character
-
-        $canStartQuotedPath = $builder.Length -eq 0
-        if ($canStartQuotedPath -and $characterCode -eq 34) {
-            $closingQuote = [char]34
-            continue
-        }
-        elseif ($canStartQuotedPath -and $characterCode -eq 39) {
-            $closingQuote = [char]39
-            continue
-        }
-        if ([char]::IsWhiteSpace($character) -or $character -eq ';') {
-            $currentPath = ConvertTo-UnquotedPathText -PathText $builder.ToString()
-            if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
-                $pathList.Add($currentPath)
-            }
-
-            [void]$builder.Clear()
-            continue
-        }
-
-        [void]$builder.Append($character)
-    }
-
-    $lastPath = ConvertTo-UnquotedPathText -PathText $builder.ToString()
-    if (-not [string]::IsNullOrWhiteSpace($lastPath)) {
-        $pathList.Add($lastPath)
-    }
-
-    return $pathList.ToArray()
 }
 
 # 校验输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件或文件夹。
@@ -372,10 +191,15 @@ function Get-LegacyOfficeFileList {
             }
         )
 
+        $scanWarningList = New-DeferredScanWarningList
         foreach ($scanError in @($scanErrors)) {
-            Write-Host "扫描跳过: $($scanError.TargetObject)" -ForegroundColor Yellow
-            Write-Host "  原因: $($scanError.Exception.Message)" -ForegroundColor DarkGray
+            Add-DeferredScanWarning `
+                -WarningList $scanWarningList `
+                -Message '扫描跳过' `
+                -Path $scanError.TargetObject `
+                -Reason $scanError.Exception.Message
         }
+        Write-DeferredScanWarningList -WarningList $scanWarningList -Title 'Office 扫描跳过汇总'
     }
 
     $legacyFiles = @(
@@ -993,23 +817,23 @@ function Invoke-ConversionPlanList {
     try {
         foreach ($plan in $convertPlans) {
             $workingMessage = "正在转换: $($plan.SourcePathText)"
-            $statusLineLength = Write-RefreshStatusLine -Message $workingMessage -Color White -NoNewLine
+            [void](Write-RefreshStatusLine -Message $workingMessage -Color White -NoNewLine)
             $result = Convert-OfficeFile -TempRootDirectory $TempRootDirectory -Plan $plan -ApplicationCache $applicationCache
             switch ($result.Status) {
                 'ConvertedToTemp' {
-                    [void](Write-RefreshStatusLine -Message "转换完成: $($plan.SourcePathText)" -Color Green -PreviousLength $statusLineLength)
+                    [void](Write-RefreshStatusLine -Message "转换完成: $($plan.SourcePathText)" -Color Green)
                     $tempConversionResults.Add([pscustomobject]@{
                             Plan           = $plan
                             TempOutputPath = $result.TempOutputPath
                         })
                 }
                 'Skipped' {
-                    [void](Write-RefreshStatusLine -Message "跳过: $($plan.TargetPathText)" -Color Yellow -PreviousLength $statusLineLength)
+                    [void](Write-RefreshStatusLine -Message "跳过: $($plan.TargetPathText)" -Color Yellow)
                     Write-Host "  原因: $($result.Message)" -ForegroundColor DarkGray
                     $skippedCount++
                 }
                 'Failed' {
-                    [void](Write-RefreshStatusLine -Message "转换失败: $($plan.SourcePathText)" -Color Red -PreviousLength $statusLineLength)
+                    [void](Write-RefreshStatusLine -Message "转换失败: $($plan.SourcePathText)" -Color Red)
                     Write-Host "  原因: $($result.Message)" -ForegroundColor DarkGray
                     $failedCount++
                 }
@@ -1018,13 +842,13 @@ function Invoke-ConversionPlanList {
     }
     finally {
         if ($applicationCache.Count -gt 0) {
-            $closeStatusLineLength = Write-RefreshStatusLine -Message '正在退出 Office 应用...' -Color White -NoNewLine
+            [void](Write-RefreshStatusLine -Message '正在退出 Office 应用...' -Color White -NoNewLine)
         }
 
         Close-OfficeApplicationCache -ApplicationCache $applicationCache
 
         if ($applicationCache.Count -gt 0) {
-            [void](Write-RefreshStatusLine -Message 'Office 应用已退出' -Color Green -PreviousLength $closeStatusLineLength)
+            [void](Write-RefreshStatusLine -Message 'Office 应用已退出' -Color Green)
         }
     }
 
@@ -1064,7 +888,7 @@ if ($null -eq $PathList -or $PathList.Count -eq 0) {
         exit 0
     }
 
-    $PathList = @(Split-InputPathLine -InputText $pathInput)
+    $PathList = @(Split-InteractivePathInput -PathInput $pathInput)
     if ($PathList.Count -gt 1) {
         Write-Host "识别到 $($PathList.Count) 个路径。" -ForegroundColor DarkGray
     }

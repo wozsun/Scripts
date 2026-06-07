@@ -556,7 +556,12 @@ function Split-InteractivePathInput {
             continue
         }
 
-        $canStartQuotedPath = $currentPartBuilder.Length -eq 0
+        $currentInputText = $currentPartBuilder.ToString()
+        $canStartQuotedPath = [string]::IsNullOrWhiteSpace($currentInputText)
+        if (-not $canStartQuotedPath) {
+            $canStartQuotedPath = [char]::IsWhiteSpace($currentInputText[$currentInputText.Length - 1])
+        }
+
         if ($canStartQuotedPath -and $quoteCloseByOpen.ContainsKey($currentChar)) {
             $activeClosingQuote = $quoteCloseByOpen[$currentChar]
             continue

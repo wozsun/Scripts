@@ -450,10 +450,11 @@ function Wait-AssumeYesDeletionGracePeriod {
     Write-Host "危险操作: 已启用 -yes，将跳过详细预览和菜单并执行默认删除。" -ForegroundColor Red
     Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
 
+    $pollInterval = [Math]::Max(1, $AssumeYesInputPollIntervalMilliseconds)
+    $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $pollInterval))
     for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
         Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
 
-        $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $AssumeYesInputPollIntervalMilliseconds))
         for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
             if (Test-EnterKeyPressed) {
                 $script:AssumeYesDeletionCancelled = $true
@@ -462,7 +463,7 @@ function Wait-AssumeYesDeletionGracePeriod {
                 return $false
             }
 
-            Start-Sleep -Milliseconds $AssumeYesInputPollIntervalMilliseconds
+            Start-Sleep -Milliseconds $pollInterval
         }
     }
 
@@ -516,9 +517,11 @@ function Split-InteractivePathInput {
         $currentChar = $trimmedPathInput[$index].ToString()
 
         if ($null -ne $activeClosingQuote) {
-            [void]$currentInputPart.Append($currentChar)
             if ($currentChar -eq $activeClosingQuote) {
                 $activeClosingQuote = $null
+            }
+            else {
+                [void]$currentInputPart.Append($currentChar)
             }
             continue
         }
@@ -531,7 +534,6 @@ function Split-InteractivePathInput {
 
         if ($canStartQuotedPath -and $quoteCloseByOpen.ContainsKey($currentChar)) {
             $activeClosingQuote = $quoteCloseByOpen[$currentChar]
-            [void]$currentInputPart.Append($currentChar)
             continue
         }
 
@@ -560,9 +562,9 @@ function Split-InteractivePathInput {
     $absolutePathSeparatorPattern = '\s+(?=(?:' + $quoteStartPattern + ')?(?:[a-zA-Z]:[\\/]|[\\/]{2}))'
     foreach ($pathPart in $pathPartList) {
         foreach ($pathSegment in [regex]::Split($pathPart, $absolutePathSeparatorPattern)) {
-            $trimmedPathSegment = $pathSegment.Trim()
-            if (-not [string]::IsNullOrWhiteSpace($trimmedPathSegment)) {
-                $resultPathList.Add($trimmedPathSegment)
+            $normalizedPath = ConvertTo-UnquotedPathText -PathText $pathSegment
+            if (-not [string]::IsNullOrWhiteSpace($normalizedPath)) {
+                $resultPathList.Add($normalizedPath)
             }
         }
     }

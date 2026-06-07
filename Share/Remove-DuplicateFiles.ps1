@@ -65,6 +65,12 @@ $AssumeYesGraceSeconds = 10
 # -yes 倒计时期间检查 Enter 输入的间隔。
 $AssumeYesInputPollIntervalMilliseconds = 100
 
+# 上一次动态状态行的显示宽度；用于本次刷新时清掉旧尾巴。
+$script:DynamicStatusLastCellWidth = 0
+
+# 记录上一条动态状态是否真的以内联方式输出；输出重定向或降级时不额外补换行。
+$script:DynamicStatusLastWriteWasInline = $false
+
 # ========== 运行环境设置 ==========
 
 Set-StrictMode -Version Latest
@@ -149,7 +155,36 @@ function Write-StageMessage {
         [string]$Message
     )
 
+    # 阶段消息是普通整行输出；先结束可能仍停留在同一行的动态进度，避免拼接到进度尾部。
+    Complete-DynamicStatusLine
     Write-Host "[进度] $Message" -ForegroundColor Cyan
+}
+
+# 输出菜单项，保持菜单编号醒目。
+function Write-MenuItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Number,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    Complete-DynamicStatusLine
+    Write-Host -NoNewline "  $Number " -ForegroundColor Cyan
+    Write-Host $Text -ForegroundColor White
+}
+
+# 输出彩色输入提示并读取一行文本。
+function Read-ColoredLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    Complete-DynamicStatusLine
+    Write-Host -NoNewline $Prompt -ForegroundColor Cyan
+    return [Console]::ReadLine()
 }
 
 # 估算字符在控制台中占用的单元格宽度；中文和全角字符通常占两格。
@@ -203,7 +238,7 @@ function Get-ConsoleTextWithinCellWidth {
     }
 }
 
-# 刷新单行动态状态：清理旧尾巴后把光标放回文本末尾，避免补空格导致光标漂移。
+# 刷新单行动态状态；不使用 SetCursorPosition，避免光标定位失败后停在补空格末尾。
 function Write-DynamicStatusLine {
     param(
         [Parameter(Mandatory = $true)]
@@ -213,27 +248,49 @@ function Write-DynamicStatusLine {
         [System.ConsoleColor]$Color
     )
 
-    try {
-        if (-not [Console]::IsOutputRedirected) {
-            $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
-            $lineText = Get-ConsoleTextWithinCellWidth -Text $Message -MaxCellWidth $maxLineWidth
+    # 动态状态必须始终是单行；即使调用方传入异常文本，也不能把进度刷新打成多行。
+    $statusMessage = $Message -replace '[\r\n]+', ' '
 
-            $cursorTop = [Console]::CursorTop
-            Write-Host -NoNewline "`r$($lineText.Text)" -ForegroundColor $Color
-            $remainingWidth = [Math]::Max(0, $maxLineWidth - $lineText.CellWidth)
-            if ($remainingWidth -gt 0) {
-                Write-Host -NoNewline (' ' * $remainingWidth)
-                [Console]::SetCursorPosition($lineText.CellWidth, $cursorTop)
-            }
+    try {
+        if ([Console]::IsOutputRedirected) {
+            Complete-DynamicStatusLine
+            Write-Host $statusMessage -ForegroundColor $Color
+            $script:DynamicStatusLastCellWidth = 0
+            $script:DynamicStatusLastWriteWasInline = $false
             return
         }
+
+        $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
+        $lineText = Get-ConsoleTextWithinCellWidth -Text $statusMessage -MaxCellWidth $maxLineWidth
+
+        # 先写“当前文本 + 必要补空格”清除上一条长文本尾巴，再回到行首写当前文本。
+        # 这样光标自然停在当前文本末尾，不依赖宿主是否支持 SetCursorPosition。
+        $clearWidth = [Math]::Min($maxLineWidth, [Math]::Max($script:DynamicStatusLastCellWidth, $lineText.CellWidth))
+        $paddingWidth = [Math]::Max(0, $clearWidth - $lineText.CellWidth)
+        $paddingText = ' ' * $paddingWidth
+        Write-Host -NoNewline "`r$($lineText.Text)$paddingText`r$($lineText.Text)" -ForegroundColor $Color
+
+        $script:DynamicStatusLastCellWidth = $lineText.CellWidth
+        $script:DynamicStatusLastWriteWasInline = $true
+        return
     }
     catch {
-        # 部分宿主不支持读取控制台宽度，回退为普通回车刷新。
-        Write-Debug "动态状态行刷新已回退: $($_.Exception.Message)"
+        # 某些宿主不支持读取控制台宽度；静默降级为普通整行输出，避免异常打断进度行。
+        Complete-DynamicStatusLine
+        Write-Host $statusMessage -ForegroundColor $Color
+        $script:DynamicStatusLastCellWidth = 0
+        $script:DynamicStatusLastWriteWasInline = $false
+    }
+}
+
+# 结束当前动态状态行；只有确实使用了内联刷新时才补换行。
+function Complete-DynamicStatusLine {
+    if ($script:DynamicStatusLastWriteWasInline) {
+        Write-Host ""
     }
 
-    Write-Host -NoNewline "`r$Message" -ForegroundColor $Color
+    $script:DynamicStatusLastCellWidth = 0
+    $script:DynamicStatusLastWriteWasInline = $false
 }
 
 # 更新百分比进度条；使用普通文本单行刷新，避免 Write-Progress 改变控制台背景色。
@@ -276,11 +333,6 @@ function Write-ProgressBar {
     $LastPercent.Value = $percent
 }
 
-# 结束当前进度条并换行，避免后续日志和动态进度混在一起。
-function Complete-ProgressBar {
-    Write-Host ""
-}
-
 # 新建延迟输出的扫描警告列表，避免进度条刷新时被错误信息打断。
 function New-DeferredScanWarningList {
     $warningList = [System.Collections.Generic.List[object]]::new()
@@ -308,6 +360,7 @@ function Add-DeferredScanWarning {
     )
 
     if ($null -eq $WarningList) {
+        Complete-DynamicStatusLine
         Write-Host "$($Message): $Path" -ForegroundColor Yellow
         Write-Host "  原因: $Reason" -ForegroundColor DarkGray
         return
@@ -334,6 +387,7 @@ function Write-DeferredScanWarningList {
         return
     }
 
+    Complete-DynamicStatusLine
     Write-Host "$($Title): $($WarningList.Count)" -ForegroundColor Yellow
     foreach ($warning in $WarningList) {
         Write-Host "$($warning.Message): $($warning.Path)" -ForegroundColor Yellow
@@ -343,6 +397,7 @@ function Write-DeferredScanWarningList {
 
 # 输出用于区分不同预览或结果块的分隔线。
 function Write-PreviewSeparator {
+    Complete-DynamicStatusLine
     Write-Host ""
     Write-Host ($PreviewSeparatorCharacter * $PreviewSeparatorCellCount) -ForegroundColor DarkGray
 }
@@ -357,6 +412,7 @@ function Write-StatusSummary {
         [System.ConsoleColor]$Color
     )
 
+    Complete-DynamicStatusLine
     Write-Host ""
     Write-Host $Message -ForegroundColor $Color
 }
@@ -364,6 +420,10 @@ function Write-StatusSummary {
 # 检查倒计时期间是否按下 Enter；不支持读取键盘状态时静默退化为只支持 Ctrl+C。
 function Test-EnterKeyPressed {
     try {
+        if ([Console]::IsInputRedirected) {
+            return $false
+        }
+
         while ([Console]::KeyAvailable) {
             $keyInfo = [Console]::ReadKey($true)
             if ($keyInfo.Key -eq [ConsoleKey]::Enter) {
@@ -385,6 +445,7 @@ function Wait-AssumeYesDeletionGracePeriod {
         [int]$Seconds = $AssumeYesGraceSeconds
     )
 
+    Complete-DynamicStatusLine
     Write-Host ""
     Write-Host "危险操作: 已启用 -yes，将跳过详细预览和菜单并执行默认删除。" -ForegroundColor Red
     Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
@@ -397,7 +458,7 @@ function Wait-AssumeYesDeletionGracePeriod {
             if (Test-EnterKeyPressed) {
                 $script:AssumeYesDeletionCancelled = $true
                 Write-DynamicStatusLine -Message '已取消 -yes 默认删除，未删除任何文件。' -Color Yellow
-                Write-Host ""
+                Complete-DynamicStatusLine
                 return $false
             }
 
@@ -406,7 +467,7 @@ function Wait-AssumeYesDeletionGracePeriod {
     }
 
     Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
-    Write-Host ""
+    Complete-DynamicStatusLine
     return $true
 }
 
@@ -611,7 +672,15 @@ function Read-InteractivePathList {
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {
-        $pathInput = (Read-Host "Path$($inputPathList.Count + 1)").Trim()
+        $pathInputRaw = Read-ColoredLine -Prompt "Path$($inputPathList.Count + 1): "
+        if ($null -eq $pathInputRaw) {
+            return [pscustomobject]@{
+                Action   = 'Exit'
+                PathList = @()
+            }
+        }
+
+        $pathInput = $pathInputRaw.Trim()
         if ($pathInput -eq '00') {
             return [pscustomobject]@{
                 Action   = 'Exit'
@@ -864,7 +933,7 @@ function Get-ScannedFileList {
 
         if ($null -eq $WarningList) {
             if ($SuppressScanStageMessages) {
-                Complete-ProgressBar
+                Complete-DynamicStatusLine
             }
             Write-DeferredScanWarningList -WarningList $scanWarningList -Title "$($ProgressLabel)扫描跳过汇总"
         }
@@ -1055,7 +1124,7 @@ function Find-DuplicateFileGroup {
         $filesByLength[$file.Length].Add($file)
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
 
     # 只有大小相同的文件才可能重复；不同大小的文件无需继续计算哈希。
     $sameLengthGroups = @(
@@ -1128,7 +1197,7 @@ function Find-DuplicateFileGroup {
         }
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $hashWarningList -Title "$($ProgressLabel)哈希跳过汇总"
 }
 
@@ -1275,8 +1344,15 @@ function Read-ManualDeletionSelection {
     }
 
     while ($true) {
-        $manualInputText = Read-Host "请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出脚本"
-        $trimmedInputText = $manualInputText.Trim()
+        $manualInputRaw = Read-ColoredLine -Prompt '请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出脚本: '
+        if ($null -eq $manualInputRaw) {
+            return [pscustomobject]@{
+                Action     = 'Exit'
+                Selections = @()
+            }
+        }
+
+        $trimmedInputText = $manualInputRaw.Trim()
 
         if ([string]::IsNullOrWhiteSpace($trimmedInputText)) {
             return [pscustomobject]@{
@@ -1444,16 +1520,16 @@ function Read-MenuChoice {
         [object[]]$MenuOptionList
     )
 
+    Complete-DynamicStatusLine
     Write-Host ""
     Write-Host $Title -ForegroundColor Cyan
     foreach ($menuOption in $MenuOptionList) {
-        Write-Host -NoNewline "  $($menuOption.Value) " -ForegroundColor Cyan
-        Write-Host $menuOption.Label
+        Write-MenuItem -Number $menuOption.Value -Text $menuOption.Label
     }
 
     $validMenuChoices = @($MenuOptionList | ForEach-Object { $_.Value })
     while ($true) {
-        $inputRaw = Read-Host "请输入选项"
+        $inputRaw = Read-ColoredLine -Prompt '请输入选项: '
 
         if ($null -eq $inputRaw) {
             Write-Host "输入流已结束，程序退出。" -ForegroundColor Yellow
@@ -1591,7 +1667,7 @@ function New-MergedDirectoryDeletionPlan {
         }
     }
     Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent) -Force
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $mergedScanWarningList -Title '合并目录扫描跳过汇总'
     Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
 
@@ -2025,7 +2101,7 @@ function New-ReferenceDirectoryIndex {
             $referenceFilesByLength[$file.Length].Add($file)
             $indexedReferenceFileCount++
         }
-        Complete-ProgressBar
+        Complete-DynamicStatusLine
         Write-StageMessage "参考目录大小索引完成，已索引文件数: $indexedReferenceFileCount"
     }
 
@@ -2248,7 +2324,7 @@ function New-ReferenceDirectoryDeletionPlan {
         $matchedTargetFilesByHash[$fullHash].TargetFiles.Add($file)
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $matchWarningList -Title '参考匹配跳过汇总'
 
     $matchedTargetFileCount = 0

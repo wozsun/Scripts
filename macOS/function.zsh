@@ -1,27 +1,5 @@
 # macOS 自定义媒体处理函数。
-
-# 自动加载同目录公共工具函数；外部只需要 source 当前文件。
-_load_common_functions() {
-    emulate -L zsh -o typeset_silent
-
-    # %x 指向当前被 source 的文件，比 %N 更适合在函数内定位脚本路径。
-    local script_path="${${(%):-%x}:A}"
-    local script_dir="${script_path:h}"
-    local common_path="$script_dir/common.zsh"
-
-    if [[ ! -r "$common_path" ]]; then
-        print -u2 -- "错误: 未找到公共工具文件: $common_path"
-        return 1
-    fi
-
-    source "$common_path"
-}
-
-if ! _load_common_functions; then
-    unfunction _load_common_functions 2>/dev/null
-    return 1 2>/dev/null || exit 1
-fi
-unfunction _load_common_functions 2>/dev/null
+# 使用前请先 source 同目录 common.zsh；本文件只定义面向日常使用的 zsh 函数。
 
 # ========== 帮助总览 ==========
 
@@ -393,7 +371,7 @@ EOF
 
     local -i failed_count=0
 
-    for file_path; do
+    for file_path in "$@"; do
         local -a files_heic=()
         local -a files_mov=()
 
@@ -941,21 +919,6 @@ EOF
 
 # ========== 媒体内部工具函数 ==========
 
-# 判断文件名主体是否符合 YYYYMMDD_HHMMSS[NN]。
-_media_is_timestamp_name() {
-    emulate -L zsh -o typeset_silent
-
-    local name_part="$1"
-    [[ "$name_part" =~ '^[0-9]{8}_[0-9]{6}((0[1-9])|([1-9][0-9]))?$' ]]
-}
-
-# 从标准时间文件名主体中取出 YYYYMMDD_HHMMSS。
-_media_timestamp_body() {
-    emulate -L zsh -o typeset_silent
-
-    print -r -- "${1:0:15}"
-}
-
 # 内部辅助函数：校验文件名与元数据一致性，并在需要时自动修复。
 # 参数: file_path label metadata_consistent create_date "field: value" ...
 _mtc_check_and_fix() {
@@ -994,7 +957,7 @@ _mtc_check_and_fix() {
         return 0
     else
         msg_warn "${label} \"$file_path\" 的一致性检查未通过："
-        for field_line; do
+        for field_line in "$@"; do
             print -r -- "$field_line"
         done
         if [[ $filename_valid -eq 1 ]]; then
@@ -1012,4 +975,19 @@ _mtc_check_and_fix() {
             return 1
         fi
     fi
+}
+
+# 判断文件名主体是否符合 YYYYMMDD_HHMMSS[NN]。
+_media_is_timestamp_name() {
+    emulate -L zsh -o typeset_silent
+
+    local name_part="$1"
+    [[ "$name_part" =~ '^[0-9]{8}_[0-9]{6}((0[1-9])|([1-9][0-9]))?$' ]]
+}
+
+# 从标准时间文件名主体中取出 YYYYMMDD_HHMMSS。
+_media_timestamp_body() {
+    emulate -L zsh -o typeset_silent
+
+    print -r -- "${1:0:15}"
 }

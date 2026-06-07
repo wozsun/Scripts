@@ -18,23 +18,18 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
-    [string[]]$Path,
+    [Alias('h')]
+    [switch]$Help,
 
-    [switch]$s,
+    [Alias('s')]
+    [switch]$IncludeHidden,
 
-    [switch]$yes,
+    [Alias('yes')]
+    [switch]$AssumeYes,
 
-    [switch]$h
+    [Parameter(Mandatory = $false, Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$PathList
 )
-
-# ========== 可调整配置 ==========
-
-# 单行进度条宽度。
-$ProgressBarWidth = 32
-
-# 使用 -yes 时，默认删除前等待的秒数。
-$YesCountdownSeconds = 10
 
 # ========== 运行环境设置 ==========
 
@@ -43,10 +38,9 @@ $ErrorActionPreference = 'Stop'
 
 # 加载 Windows 脚本公共工具函数。
 Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
-Set-ConsoleOutputConfig -ProgressBarCellCount $ProgressBarWidth
 
 # 是否把隐藏文件夹也作为可删除候选；空目录判断始终会检查隐藏和系统项。
-$IncludeHiddenFolderCandidates = [bool]$s
+$IncludeHiddenFolderCandidates = [bool]$IncludeHidden
 
 # ========== 输出与工具函数 ==========
 
@@ -345,7 +339,7 @@ function New-EmptyFolderDeletionPlan {
         }
     }
     Write-ProgressBar -Activity $activity -Status '空文件夹判断完成' -ProcessedCount $sortedDirectoryList.Count -TotalCount $sortedDirectoryList.Count -LastPercent ([ref]$lastFolderCheckPercent) -Force
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
 
     return [pscustomobject]@{
         Items  = $plannedDirectoryList.ToArray()
@@ -390,7 +384,7 @@ function Write-DeletionPreview {
 
     Write-Host
     Write-Host "删除预览:" -ForegroundColor Yellow
-    Write-Host "================================================================" -ForegroundColor DarkGray
+    Write-PreviewSeparator -NoLeadingBlank
 
     $index = 0
     foreach ($planItem in $DeletionPlanList) {
@@ -399,7 +393,7 @@ function Write-DeletionPreview {
         Write-Host $planItem.FullName -ForegroundColor White
     }
 
-    Write-Host "================================================================" -ForegroundColor DarkGray
+    Write-PreviewSeparator -NoLeadingBlank
     Write-Host
     Write-Host -NoNewline "空文件夹列举完成。默认计划删除空文件夹数: " -ForegroundColor White
     Write-Host $DeletionPlanList.Count -ForegroundColor Magenta
@@ -407,22 +401,16 @@ function Write-DeletionPreview {
 
 # 读取操作菜单。
 function Read-OperationChoice {
-    while ($true) {
-        Write-Host
-        Write-Host "请选择操作:" -ForegroundColor Cyan
-        Write-MenuItem -Number '1' -Text '默认删除'
-        Write-MenuItem -Number '2' -Text '手动删除'
-        Write-MenuItem -Number '0' -Text '退出脚本'
+    $choice = Read-MenuChoice -Title '请选择操作:' -EndOfInputChoice '0' -MenuOptionList @(
+        [pscustomobject]@{ Value = '1'; Label = '默认删除' }
+        [pscustomobject]@{ Value = '2'; Label = '手动删除' }
+        [pscustomobject]@{ Value = '0'; Label = '退出脚本' }
+    )
 
-        $choice = Read-ColoredLine -Prompt '请输入选项: '
-        switch ($choice.Trim()) {
-            '1' { return 'Default' }
-            '2' { return 'Manual' }
-            '0' { return 'Exit' }
-            default {
-                Write-Host "输入无效，请输入 1、2 或 0。" -ForegroundColor Red
-            }
-        }
+    switch ($choice) {
+        '1' { return 'Default' }
+        '2' { return 'Manual' }
+        '0' { return 'Exit' }
     }
 }
 
@@ -437,6 +425,11 @@ function Read-ManualDeletionSelection {
         Write-Host
         Write-Host "请输入要删除的编号，多个编号用英文逗号分隔；输入 0 取消，输入 00 退出脚本。" -ForegroundColor Cyan
         $inputText = Read-ColoredLine -Prompt '编号: '
+        if ($null -eq $inputText) {
+            Write-Host "输入流已结束，程序退出。" -ForegroundColor Yellow
+            exit 0
+        }
+
         $trimmedInput = $inputText.Trim()
 
         if ($trimmedInput -eq '00') {
@@ -476,47 +469,6 @@ function Read-ManualDeletionSelection {
 
         return $selectedItemList.ToArray()
     }
-}
-
-# 使用 -yes 时给出倒计时，留出中止机会。
-function Wait-DefaultDeletionCountdown {
-    param(
-        [Parameter(Mandatory = $true)]
-        [int]$DeletionCount
-    )
-
-    Write-Host
-    Write-Host "已启用 -yes，将跳过详细预览并执行默认删除。" -ForegroundColor Yellow
-    Write-Host "计划删除空文件夹数: $DeletionCount" -ForegroundColor Yellow
-
-    for ($remainingSeconds = $YesCountdownSeconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
-
-        $deadline = (Get-Date).AddSeconds(1)
-        while ((Get-Date) -lt $deadline) {
-            try {
-                if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
-                    $key = [Console]::ReadKey($true)
-                    if ($key.Key -eq [ConsoleKey]::Enter) {
-                        Write-DynamicStatusLine -Message '已取消默认删除。' -Color Yellow
-                        Write-Host ""
-                        return $false
-                    }
-                }
-            }
-            catch {
-                Start-Sleep -Seconds $remainingSeconds
-                Write-Host ""
-                return $true
-            }
-
-            Start-Sleep -Milliseconds 50
-        }
-    }
-
-    Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
-    Write-Host ""
-    return $true
 }
 
 # 删除选定的空文件夹。
@@ -576,7 +528,7 @@ function Invoke-EmptyFolderDeletion {
     }
 
     Write-ProgressBar -Activity $activity -Status '空文件夹删除完成' -ProcessedCount $orderedTargetList.Count -TotalCount $orderedTargetList.Count -LastPercent ([ref]$lastDeletionPercent) -Force
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
 
     if ($deletedList.Count -gt 0) {
         Write-Host
@@ -615,16 +567,16 @@ function Invoke-EmptyFolderDeletion {
 
 # ========== 主逻辑 ==========
 
-if ($h) {
+if ($Help) {
     Show-HelpText
     exit 0
 }
 
-if ($null -eq $Path -or $Path.Count -eq 0) {
+if ($null -eq $PathList -or $PathList.Count -eq 0) {
     $RootPathList = @(Read-InteractiveDirectoryList)
 }
 else {
-    $resolvedPathResult = Resolve-InputDirectoryList -RawPathList $Path
+    $resolvedPathResult = Resolve-InputDirectoryList -RawPathList $PathList
     if (-not $resolvedPathResult.Success) {
         Write-Host $resolvedPathResult.Error -ForegroundColor Red
         exit 1
@@ -645,12 +597,15 @@ if ($DeletionPlanList.Count -eq 0) {
     exit 0
 }
 
-if ($yes) {
+if ($AssumeYes) {
     Write-Host
     Write-Host -NoNewline "扫描完成。默认计划删除空文件夹数: " -ForegroundColor White
     Write-Host $DeletionPlanList.Count -ForegroundColor Magenta
 
-    if (Wait-DefaultDeletionCountdown -DeletionCount $DeletionPlanList.Count) {
+    if (Wait-AssumeYesDeletionGracePeriod `
+            -WarningMessage '已启用 -yes，将跳过详细预览并执行默认删除。' `
+            -AdditionalWarningMessage "计划删除空文件夹数: $($DeletionPlanList.Count)" `
+            -CancelledMessage '已取消默认删除。') {
         Invoke-EmptyFolderDeletion -TargetDirectoryList $DeletionPlanList
     }
     exit 0

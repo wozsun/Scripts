@@ -40,27 +40,6 @@ param(
 # 部分哈希预筛选时读取文件头尾每段的字节数；值越大越稳，扫描成本也越高。
 $PartialHashSegmentByteCount = 256KB
 
-# 删除预览中分隔不同重复文件组的横线长度。
-$PreviewSeparatorCellCount = 64
-
-# 删除预览中分隔不同重复文件组的字符。
-$PreviewSeparatorCharacter = '='
-
-# 文本进度条宽度。
-$ProgressBarCellCount = 32
-
-# 文本进度条已完成部分的字符。
-$ProgressBarFilledCharacter = '#'
-
-# 文本进度条未完成部分的字符。
-$ProgressBarEmptyCharacter = '-'
-
-# 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
-$AssumeYesGraceSeconds = 10
-
-# -yes 倒计时期间检查 Enter 输入的间隔。
-$AssumeYesInputPollIntervalMilliseconds = 100
-
 # ========== 运行环境设置 ==========
 
 Set-StrictMode -Version Latest
@@ -70,10 +49,6 @@ $ErrorActionPreference = 'Stop'
 
 # 加载 Windows 脚本公共工具函数。
 Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
-Set-ConsoleOutputConfig `
-    -ProgressBarCellCount $ProgressBarCellCount `
-    -ProgressBarFilledCharacter $ProgressBarFilledCharacter `
-    -ProgressBarEmptyCharacter $ProgressBarEmptyCharacter
 
 # ========== 参数派生选项 ==========
 
@@ -143,75 +118,6 @@ function Write-EnabledOptionNotice {
     if ($AssumeYesDeletion) {
         Write-Host "已启用 -yes：扫描完成后将输出汇总，并跳过详细预览和删除选择菜单。" -ForegroundColor Red
     }
-}
-
-# 输出用于区分不同预览或结果块的分隔线。
-function Write-PreviewSeparator {
-    Write-Host ""
-    Write-Host ($PreviewSeparatorCharacter * $PreviewSeparatorCellCount) -ForegroundColor DarkGray
-}
-
-# 输出阶段汇总；前置空行让它和列表内容、删除明细保持清楚间隔。
-function Write-StatusSummary {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [Parameter(Mandatory = $true)]
-        [System.ConsoleColor]$Color
-    )
-
-    Write-Host ""
-    Write-Host $Message -ForegroundColor $Color
-}
-
-# 检查倒计时期间是否按下 Enter；不支持读取键盘状态时静默退化为只支持 Ctrl+C。
-function Test-EnterKeyPressed {
-    try {
-        while ([Console]::KeyAvailable) {
-            $keyInfo = [Console]::ReadKey($true)
-            if ($keyInfo.Key -eq [ConsoleKey]::Enter) {
-                return $true
-            }
-        }
-    }
-    catch {
-        return $false
-    }
-
-    return $false
-}
-
-# -yes 会跳过人工确认，因此执行删除前提供醒目的中止窗口。
-function Wait-AssumeYesDeletionGracePeriod {
-    param(
-        [Parameter(Mandatory = $false)]
-        [int]$Seconds = $AssumeYesGraceSeconds
-    )
-
-    Write-Host ""
-    Write-Host "危险操作: 已启用 -yes，将跳过详细预览和菜单并执行默认删除。" -ForegroundColor Red
-    Write-Host "如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。" -ForegroundColor Yellow
-
-    for ($remainingSeconds = $Seconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
-
-        $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $AssumeYesInputPollIntervalMilliseconds))
-        for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
-            if (Test-EnterKeyPressed) {
-                $script:AssumeYesDeletionCancelled = $true
-                Write-DynamicStatusLine -Message '已取消 -yes 默认删除，未删除任何文件。' -Color Yellow
-                Write-Host ""
-                return $false
-            }
-
-            Start-Sleep -Milliseconds $AssumeYesInputPollIntervalMilliseconds
-        }
-    }
-
-    Write-DynamicStatusLine -Message '倒计时结束，开始执行默认删除。' -Color Magenta
-    Write-Host ""
-    return $true
 }
 
 # 校验输入路径是否为存在的 Windows 绝对目录，并返回规范化后的完整路径。
@@ -316,7 +222,15 @@ function Read-InteractivePathList {
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {
-        $pathInput = (Read-Host "Path$($inputPathList.Count + 1)").Trim()
+        $pathInputRaw = Read-ColoredLine -Prompt "Path$($inputPathList.Count + 1): "
+        if ($null -eq $pathInputRaw) {
+            return [pscustomobject]@{
+                Action   = 'Exit'
+                PathList = @()
+            }
+        }
+
+        $pathInput = $pathInputRaw.Trim()
         if ($pathInput -eq '00') {
             return [pscustomobject]@{
                 Action   = 'Exit'
@@ -526,7 +440,7 @@ function Get-ScannedFileList {
 
         if ($null -eq $WarningList) {
             if ($SuppressScanStageMessages) {
-                Complete-ProgressBar
+                Complete-DynamicStatusLine
             }
             Write-DeferredScanWarningList -WarningList $scanWarningList -Title "$($ProgressLabel)扫描跳过汇总"
         }
@@ -541,31 +455,6 @@ function Get-ScannedFileList {
 }
 
 # ========== 路径显示与默认保留规则 ==========
-
-# 将完整文件路径转换为便于日志阅读的相对路径，可附加目录名前缀。
-function Get-RelativePathText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo]$File,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RootPath,
-
-        [Parameter(Mandatory = $false)]
-        [string]$PathPrefix
-    )
-
-    $relativePathText = [System.IO.Path]::GetRelativePath($RootPath, $File.FullName)
-    if ($relativePathText.StartsWith('..', [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($relativePathText)) {
-        $relativePathText = $File.Name
-    }
-
-    if ([string]::IsNullOrWhiteSpace($PathPrefix)) {
-        return $relativePathText
-    }
-
-    return "$PathPrefix\$relativePathText"
-}
 
 # 获取目录最后一级名称，用于多目录日志前缀。
 function Get-DirectoryLabel {
@@ -588,16 +477,6 @@ function Get-FileParentDirectoryPath {
     return ConvertTo-NormalizedDirectoryPath -Path (Split-Path -Parent $File.FullName)
 }
 
-# 统计目录路径层级；层级越少，默认保留优先级越高。
-function Get-DirectoryPathDepth {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    return @($Path -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
-}
-
 # 按默认保留规则排序文件：目录越靠上越优先，同目录内文件名越短越优先。
 function Get-FileListByKeepPriority {
     param(
@@ -606,7 +485,7 @@ function Get-FileListByKeepPriority {
     )
 
     return $FileList |
-        Sort-Object @{ Expression = { Get-DirectoryPathDepth -Path (Get-FileParentDirectoryPath -File $_) }; Ascending = $true },
+        Sort-Object @{ Expression = { Get-DirectoryPathDepth -DirectoryPath (Get-FileParentDirectoryPath -File $_) }; Ascending = $true },
                     @{ Expression = { (Get-FileParentDirectoryPath -File $_).Length }; Ascending = $true },
                     @{ Expression = { $_.Name.Length }; Ascending = $true },
                     @{ Expression = { $_.Name }; Ascending = $true },
@@ -644,7 +523,7 @@ function Get-FileDisplayPath {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($RootPath)) {
-        return Get-RelativePathText -File $File -RootPath $RootPath -PathPrefix $PathPrefix
+        return Get-RelativePathText -RootPath $RootPath -FilePath $File.FullName -PathPrefix $PathPrefix
     }
 
     return $File.FullName
@@ -711,7 +590,7 @@ function Find-DuplicateFileGroup {
         $filesByLength[$file.Length].Add($file)
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
 
     # 只有大小相同的文件才可能重复；不同大小的文件无需继续计算哈希。
     $sameLengthGroups = @(
@@ -784,7 +663,7 @@ function Find-DuplicateFileGroup {
         }
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $hashWarningList -Title "$($ProgressLabel)哈希跳过汇总"
 }
 
@@ -931,8 +810,15 @@ function Read-ManualDeletionSelection {
     }
 
     while ($true) {
-        $manualInputText = Read-Host "请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出脚本"
-        $trimmedInputText = $manualInputText.Trim()
+        $manualInputRaw = Read-ColoredLine -Prompt '请输入要删除的编号，多个编号用逗号分隔；直接回车使用默认规则；输入 0 跳过；输入 00 退出脚本: '
+        if ($null -eq $manualInputRaw) {
+            return [pscustomobject]@{
+                Action     = 'Exit'
+                Selections = @()
+            }
+        }
+
+        $trimmedInputText = $manualInputRaw.Trim()
 
         if ([string]::IsNullOrWhiteSpace($trimmedInputText)) {
             return [pscustomobject]@{
@@ -1090,42 +976,6 @@ function New-DeletionActionMenuOptionList {
     return $menuOptionList.ToArray()
 }
 
-# 输出通用菜单并读取用户选择。
-function Read-MenuChoice {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Title,
-
-        [Parameter(Mandatory = $true)]
-        [object[]]$MenuOptionList
-    )
-
-    Write-Host ""
-    Write-Host $Title -ForegroundColor Cyan
-    foreach ($menuOption in $MenuOptionList) {
-        Write-Host -NoNewline "  $($menuOption.Value) " -ForegroundColor Cyan
-        Write-Host $menuOption.Label
-    }
-
-    $validMenuChoices = @($MenuOptionList | ForEach-Object { $_.Value })
-    while ($true) {
-        $inputRaw = Read-Host "请输入选项"
-
-        if ($null -eq $inputRaw) {
-            Write-Host "输入流已结束，程序退出。" -ForegroundColor Yellow
-            return "00"
-        }
-
-        $menuChoice = $inputRaw.Trim()
-
-        if ($validMenuChoices -contains $menuChoice) {
-            return $menuChoice
-        }
-
-        Write-Host "输入无效，请输入: $($validMenuChoices -join ', ')" -ForegroundColor Red
-    }
-}
-
 # 输出操作菜单并读取用户选择。
 function Read-DeletionAction {
     param(
@@ -1208,7 +1058,7 @@ function New-SingleDirectoryDeletionPlan {
         [pscustomobject]@{
             Hash           = $duplicateGroupRecord.Hash
             KeepFile      = $defaultKeepFile
-            KeepPathText  = Get-RelativePathText -File $defaultKeepFile -RootPath $RootPath
+            KeepPathText  = Get-RelativePathText -RootPath $RootPath -FilePath $defaultKeepFile.FullName
             DeletionItems = New-DeletionItemList -FileList $filesToDelete -RootPath $RootPath
             DuplicateFiles = $duplicateFiles
         }
@@ -1242,12 +1092,12 @@ function New-MergedDirectoryDeletionPlan {
         foreach ($file in $scannedFiles) {
             $fileRecordList.Add([pscustomobject]@{
                 File        = $file
-                DisplayPath = Get-RelativePathText -File $file -RootPath $rootPath -PathPrefix $pathPrefix
+                DisplayPath = Get-RelativePathText -RootPath $rootPath -FilePath $file.FullName -PathPrefix $pathPrefix
             })
         }
     }
     Write-ProgressBar -Activity '合并目录扫描' -Status '扫描完成' -ProcessedCount $RootPathList.Count -TotalCount $RootPathList.Count -LastPercent ([ref]$lastMergedScanPercent) -Force
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $mergedScanWarningList -Title '合并目录扫描跳过汇总'
     Write-StageMessage "合并目录扫描完成，目录数: $($RootPathList.Count)，文件数: $mergedScanFileCount，$hiddenScopeText"
 
@@ -1507,7 +1357,8 @@ function Invoke-DeletionPlanAction {
     if ($ShouldAssumeYesDeletion) {
         [void](Write-DeletionPlanSummary -DeletionPlanList $DeletionPlanList -SummaryMessageTemplate $PreviewSummaryMessageTemplate)
 
-        if (-not (Wait-AssumeYesDeletionGracePeriod)) {
+        if (-not (Wait-AssumeYesDeletionGracePeriod -CancelledMessage '已取消 -yes 默认删除，未删除任何文件。')) {
+            $script:AssumeYesDeletionCancelled = $true
             return 'Exit'
         }
 
@@ -1679,7 +1530,7 @@ function New-ReferenceDirectoryIndex {
             $referenceFilesByLength[$file.Length].Add($file)
             $indexedReferenceFileCount++
         }
-        Complete-ProgressBar
+        Complete-DynamicStatusLine
         Write-StageMessage "参考目录大小索引完成，已索引文件数: $indexedReferenceFileCount"
     }
 
@@ -1897,7 +1748,7 @@ function New-ReferenceDirectoryDeletionPlan {
         $matchedTargetFilesByHash[$fullHash].TargetFiles.Add($file)
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     Write-DeferredScanWarningList -WarningList $matchWarningList -Title '参考匹配跳过汇总'
 
     $matchedTargetFileCount = 0
@@ -1913,7 +1764,7 @@ function New-ReferenceDirectoryDeletionPlan {
 
         [pscustomobject]@{
             Hash          = $matchRecord.Hash
-            KeepPathText = Get-RelativePathText -File $referenceKeepFile -RootPath $referenceRootPath -PathPrefix $referencePathPrefix
+            KeepPathText = Get-RelativePathText -RootPath $referenceRootPath -FilePath $referenceKeepFile.FullName -PathPrefix $referencePathPrefix
             DeletionItems = New-DeletionItemList -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
         }
     }

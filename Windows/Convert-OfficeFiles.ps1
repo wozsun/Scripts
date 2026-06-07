@@ -33,9 +33,6 @@ param(
 # 转换完成后统一移动文件前的单文件等待时间，给 OneDrive 等同步目录留出短暂缓冲。
 $FileMoveDelayMilliseconds = 1000
 
-# 进度条宽度，统一使用 # 和 -，便于在 Windows/macOS 终端中保持可读。
-$ProgressBarCellCount = 32
-
 # 输入根目录下的脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
 $TempRootDirectoryName = '.convert-officefiles-tmp'
 
@@ -68,7 +65,6 @@ $ErrorActionPreference = 'Stop'
 
 # 加载 Windows 脚本公共工具函数。
 Import-Module -Name (Join-Path $PSScriptRoot 'common.psm1') -Force
-Set-ConsoleOutputConfig -ProgressBarCellCount $ProgressBarCellCount
 
 # ========== 参数派生选项 ==========
 
@@ -138,24 +134,6 @@ function Resolve-InputPathList {
             Resolve-InputPath -PathText $InputPathList[$index] -ParameterName "Path$($index + 1)"
         }
     )
-}
-
-# 输出相对路径用于展示，避免终端日志被完整绝对路径撑得过长。
-function Get-RelativePathText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RootPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath
-    )
-
-    $relativePathText = [System.IO.Path]::GetRelativePath($RootPath, $FilePath)
-    if ($relativePathText.StartsWith('..', [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($relativePathText)) {
-        return [System.IO.Path]::GetFileName($FilePath)
-    }
-
-    return $relativePathText
 }
 
 # 递归扫描旧格式 Office 文件；扫描错误只记录，不中断整个脚本。
@@ -260,7 +238,7 @@ function New-ConversionPlanList {
             })
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
     return $plans.ToArray()
 }
 
@@ -404,7 +382,10 @@ function Initialize-TempRootDirectory {
         Write-Host "临时目录已存在且不为空: $tempRootDirectory" -ForegroundColor Yellow
         Write-Host "请先处理或清空此文件夹中的内容；处理完成后按 Enter 继续。" -ForegroundColor Yellow
         Write-Host "如需退出脚本，请按 Ctrl+C。" -ForegroundColor DarkGray
-        [void](Read-Host "等待处理完成")
+        $continueInput = Read-ColoredLine -Prompt "等待处理完成: "
+        if ($null -eq $continueInput) {
+            throw "输入流已结束，临时目录仍非空: $tempRootDirectory"
+        }
 
         if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
             return (New-TempRootDirectory -RootPath $RootPath)
@@ -419,7 +400,7 @@ function Initialize-TempRootDirectory {
 }
 
 # 尝试删除空的脚本专属临时目录；非空时保留，避免误删用户仍需处理的内容。
-function Remove-TempRootDirectory {
+function Remove-TempRootDirectoryIfEmpty {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RootPath
@@ -764,7 +745,7 @@ function Move-ConvertedOfficeFileList {
         }
     }
 
-    Complete-ProgressBar
+    Complete-DynamicStatusLine
 
     foreach ($warningMessage in $warningMessages) {
         Write-Host $warningMessage -ForegroundColor Yellow
@@ -877,7 +858,13 @@ if ($null -eq $PathList -or $PathList.Count -eq 0) {
     Write-Host "请输入文件或目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
     Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
     Write-Host "直接回车退出；输入 0 退出脚本。" -ForegroundColor DarkGray
-    $pathInput = (Read-Host 'Path').Trim()
+    $pathInputRaw = Read-ColoredLine -Prompt 'Path: '
+    if ($null -eq $pathInputRaw) {
+        Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
+        exit 0
+    }
+
+    $pathInput = $pathInputRaw.Trim()
     if ([string]::IsNullOrWhiteSpace($pathInput)) {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
@@ -945,6 +932,6 @@ foreach ($conversionScope in $conversionScopeList) {
         }
     }
     finally {
-        [void](Remove-TempRootDirectory -RootPath $conversionScope.RootPath)
+        [void](Remove-TempRootDirectoryIfEmpty -RootPath $conversionScope.RootPath)
     }
 }

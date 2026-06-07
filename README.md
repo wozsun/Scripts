@@ -31,4 +31,9 @@ Windows 脚本说明见 [Windows/README.md](Windows/README.md)。
 
 ## macOS 脚本
 
-`macOS/function.zsh` 是自定义函数入口，会自动加载同目录的 `common.zsh`。通常在 zsh 配置文件中 source `function.zsh` 即可。
+macOS 脚本说明见 [macOS/README.md](macOS/README.md)。
+
+当前包含：
+
+- `function.zsh`：macOS zsh 自定义函数入口，提供媒体时间写入、重命名、归类、校验和图片转 webp 等函数。
+- `common.zsh`：macOS zsh 公共工具函数，提供彩色输出、文件扫描、唯一文件名生成、安全移动和临时文件清理等内部能力。

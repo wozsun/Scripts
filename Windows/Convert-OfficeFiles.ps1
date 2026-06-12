@@ -83,7 +83,7 @@ function Show-HelpText {
 参数：
   Path
     一个或多个文件或文件夹绝对路径。文件路径会直接转换；文件夹路径会递归扫描。
-    未提供时会引导交互输入，交互时可在同一行输入多个路径；路径含空格请使用英文引号。
+    未提供时会引导交互输入，交互时可在同一行输入多个路径；路径含空格时，请使用英文引号包裹路径。
 
   -s
     包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
@@ -92,14 +92,14 @@ function Show-HelpText {
   默认保留原始 .doc、.xls、.ppt 文件。
   如果目标 .docx、.xlsx、.pptx 已存在，则跳过，不覆盖。
   脚本扫描后直接转换，不需要预览确认。
-  扫描前会检查输入目录或直接文件所在目录下的专属临时文件夹；如已有内容，会等待用户清理。
+  存在待转换文件时会创建输入目录或直接文件所在目录下的专属临时文件夹；如该临时目录已存在，会清空复用。
   脚本会先转换到该专属临时文件夹，退出 Office 后再统一移动到目标位置。
   每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
 '@
 }
 
-# 校验输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件或文件夹。
-function Resolve-InputPath {
+# 校验 Office 转换输入路径：仅接受 Windows 绝对路径，并确保最终指向单个文件或文件夹。
+function Resolve-OfficeInputPath {
     param(
         [Parameter(Mandatory = $true)]
         [string]$PathText,
@@ -108,32 +108,53 @@ function Resolve-InputPath {
         [string]$ParameterName = 'Path'
     )
 
+    $resolvedResult = common\Resolve-InputPath -PathText $PathText -PathType Any
+    if ($resolvedResult.Success) {
+        return $resolvedResult.Item
+    }
+
     $normalizedPathText = ConvertTo-UnquotedPathText -PathText $PathText
-    $isAbsolutePath = $normalizedPathText -match '^[a-zA-Z]:[\\/]' -or $normalizedPathText -match '^[\\/]{2}'
-    if (-not $isAbsolutePath) {
+    if ($resolvedResult.Error -eq '请输入 Windows 绝对路径。') {
         throw "$ParameterName 必须是 Windows 文件或文件夹绝对路径。"
     }
 
-    $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
-    if ($resolvedPaths.Count -ne 1) {
+    if ($resolvedResult.Error -eq '路径必须只能解析到一个文件或文件夹。') {
         throw "$ParameterName 必须只能解析到一个文件或文件夹。"
     }
 
-    return (Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop)
+    throw "$ParameterName 无法读取: $normalizedPathText。原因: $($resolvedResult.Error)"
 }
 
-# 逐个校验输入路径，并返回文件系统对象。
-function Resolve-InputPathList {
+# 逐个校验 Office 转换输入路径，自动去重后返回文件系统对象。
+function Resolve-OfficeInputPathList {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$InputPathList
     )
 
-    return @(
-        for ($index = 0; $index -lt $InputPathList.Count; $index++) {
-            Resolve-InputPath -PathText $InputPathList[$index] -ParameterName "Path$($index + 1)"
+    $resolvedResult = common\Resolve-InputPathList -PathList $InputPathList -PathType Any
+    if ($resolvedResult.Success) {
+        return @($resolvedResult.Items)
+    }
+
+    $errorMessageList = [System.Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $InputPathList.Count; $index++) {
+        $singleResult = common\Resolve-InputPath -PathText $InputPathList[$index] -PathType Any
+        if (-not $singleResult.Success) {
+            try {
+                [void](Resolve-OfficeInputPath -PathText $InputPathList[$index] -ParameterName "Path$($index + 1)")
+            }
+            catch {
+                $errorMessageList.Add($_.Exception.Message)
+            }
         }
-    )
+    }
+
+    if ($errorMessageList.Count -gt 0) {
+        throw "输入路径校验失败:`n$($errorMessageList -join "`n")"
+    }
+
+    throw $resolvedResult.Error
 }
 
 # 递归扫描旧格式 Office 文件；扫描错误只记录，不中断整个脚本。
@@ -160,14 +181,23 @@ function Get-LegacyOfficeFileList {
             $files = @(Get-ChildItem -LiteralPath $RootPath -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
         }
 
-        $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
-        $separatorCharacters = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-        $tempRootPrefix = $tempRootDirectory.TrimEnd($separatorCharacters) + [System.IO.Path]::DirectorySeparatorChar
-        $files = @(
-            $files | Where-Object {
-                -not $_.FullName.StartsWith($tempRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        $filteredFileList = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        foreach ($file in $files) {
+            $relativePath = [System.IO.Path]::GetRelativePath($RootPath, $file.FullName)
+            $separatorIndex = $relativePath.IndexOfAny([char[]]@('\', '/'))
+            if ($separatorIndex -ge 0) {
+                $firstPathSegment = $relativePath.Substring(0, $separatorIndex)
             }
-        )
+            else {
+                $firstPathSegment = $relativePath
+            }
+
+            if (-not (Test-SiblingTempDirectoryName -DirectoryName $firstPathSegment -TempDirectoryName $TempRootDirectoryName)) {
+                $filteredFileList.Add($file)
+            }
+        }
+
+        $files = $filteredFileList.ToArray()
 
         $scanWarningList = New-DeferredScanWarningList
         foreach ($scanError in @($scanErrors)) {
@@ -180,11 +210,13 @@ function Get-LegacyOfficeFileList {
         Write-DeferredScanWarningList -WarningList $scanWarningList -Title 'Office 扫描跳过汇总'
     }
 
-    $legacyFiles = @(
-        $files | Where-Object {
-            $OfficeFormatMap.ContainsKey($_.Extension.ToLowerInvariant())
+    $legacyFileList = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    foreach ($file in $files) {
+        if ($OfficeFormatMap.ContainsKey($file.Extension.ToLowerInvariant())) {
+            $legacyFileList.Add($file)
         }
-    )
+    }
+    $legacyFiles = $legacyFileList.ToArray()
 
     $hiddenModeText = if ($ShouldIncludeHiddenItems) { '包含隐藏项' } else { '不包含隐藏项' }
     if ($null -ne $SourceFileList) {
@@ -225,7 +257,7 @@ function New-ConversionPlanList {
 
         $format = $OfficeFormatMap[$file.Extension.ToLowerInvariant()]
         $targetPath = [System.IO.Path]::ChangeExtension($file.FullName, $format.TargetExtension)
-        $status = if (Test-Path -LiteralPath $targetPath) { 'SkipExists' } else { 'Convert' }
+        $status = if (Test-FileSystemPath -Path $targetPath) { 'SkipExists' } else { 'Convert' }
 
         $plans.Add([pscustomobject]@{
                 AppName        = $format.AppName
@@ -254,6 +286,11 @@ function New-ConversionScopeList {
     $directFileScopeByRoot = @{}
 
     foreach ($inputItem in $InputItemList) {
+        if (-not $ShouldIncludeHiddenItems -and (Test-HiddenFileSystemItem -Item $inputItem)) {
+            Write-Host "跳过隐藏输入项: $($inputItem.FullName)；如需处理隐藏项，请传入 -s。" -ForegroundColor Yellow
+            continue
+        }
+
         if ($inputItem -is [System.IO.DirectoryInfo]) {
             if ($directoryRootSet.Add($inputItem.FullName)) {
                 $scopeList.Add([pscustomobject]@{
@@ -302,127 +339,40 @@ function Write-ConversionPlanSummary {
     return $convertPlans.Count
 }
 
-# 获取输入根目录下的脚本专属临时目录。
-function Get-TempRootDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RootPath
-    )
-
-    return [System.IO.Path]::Combine($RootPath, $TempRootDirectoryName)
-}
-
-# 确保脚本专属临时目录存在，并避免误用同名文件。
-function New-TempRootDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RootPath
-    )
-
-    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
-
-    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
-        throw "临时目录路径被同名文件占用: $tempRootDirectory"
-    }
-
-    New-Item -ItemType Directory -Path $tempRootDirectory -Force -ErrorAction Stop | Out-Null
-    $createdDirectory = Get-Item -LiteralPath $tempRootDirectory -ErrorAction Stop
-    if (-not $createdDirectory.PSIsContainer) {
-        throw "临时路径不是文件夹: $tempRootDirectory"
-    }
-
-    return $createdDirectory.FullName
-}
-
-# 获取目录中的项目数量，扫描隐藏项以确保临时目录真正为空。
-function Get-DirectoryItemCount {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DirectoryPath,
-
-        [Parameter(Mandatory = $false)]
-        [switch]$TreatErrorAsNonEmpty
-    )
-
-    try {
-        return @(Get-ChildItem -LiteralPath $DirectoryPath -Force -ErrorAction Stop).Count
-    }
-    catch {
-        if ($TreatErrorAsNonEmpty) {
-            return 1
-        }
-
-        throw
-    }
-}
-
-# 扫描前准备临时目录；如果已有内容，暂停等待用户清理后再继续。
+# 扫描前准备本轮临时目录；已有残留临时目录时会清空复用。
 function Initialize-TempRootDirectory {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RootPath
     )
 
-    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
-    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
-        throw "临时目录路径被同名文件占用: $tempRootDirectory"
-    }
-
-    if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
-        return (New-TempRootDirectory -RootPath $RootPath)
-    }
-
-    $tempRootItem = Get-Item -LiteralPath $tempRootDirectory -ErrorAction Stop
-    if (-not $tempRootItem.PSIsContainer) {
-        throw "临时路径不是文件夹: $tempRootDirectory"
-    }
-
-    while (Get-DirectoryItemCount -DirectoryPath $tempRootDirectory) {
-        Write-Host ""
-        Write-Host "临时目录已存在且不为空: $tempRootDirectory" -ForegroundColor Yellow
-        Write-Host "请先处理或清空此文件夹中的内容；处理完成后按 Enter 继续。" -ForegroundColor Yellow
-        Write-Host "如需退出脚本，请按 Ctrl+C。" -ForegroundColor DarkGray
-        $continueInput = Read-ColoredLine -Prompt "等待处理完成: "
-        if ($null -eq $continueInput) {
-            throw "输入流已结束，临时目录仍非空: $tempRootDirectory"
-        }
-
-        if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
-            return (New-TempRootDirectory -RootPath $RootPath)
-        }
-
-        if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
-            throw "临时目录路径被同名文件占用: $tempRootDirectory"
-        }
-    }
-
-    return $tempRootDirectory
+    return Initialize-SiblingTempDirectory -ParentPath $RootPath -TempDirectoryName $TempRootDirectoryName
 }
 
 # 尝试删除空的脚本专属临时目录；非空时保留，避免误删用户仍需处理的内容。
 function Remove-TempRootDirectoryIfEmpty {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$TempRootDirectory
     )
 
-    $tempRootDirectory = Get-TempRootDirectory -RootPath $RootPath
-    if (-not (Test-Path -LiteralPath $tempRootDirectory)) {
+    $tempRootParentPath = Split-Path -Parent $TempRootDirectory
+    try {
+        $removed = Remove-EmptySiblingTempDirectory `
+            -TempDirectoryPath $TempRootDirectory `
+            -ParentPath $tempRootParentPath `
+            -TempDirectoryName $TempRootDirectoryName
+        if (-not $removed) {
+            Write-Host "临时目录未清理: 目录仍有内容: $TempRootDirectory" -ForegroundColor Yellow
+            return $false
+        }
+
         return $true
     }
-
-    if (Test-Path -LiteralPath $tempRootDirectory -PathType Leaf) {
-        Write-Host "临时目录清理跳过: 路径被同名文件占用: $tempRootDirectory" -ForegroundColor Yellow
+    catch {
+        Write-Host "临时目录清理跳过: $($_.Exception.Message)" -ForegroundColor Yellow
         return $false
     }
-
-    if (Get-DirectoryItemCount -DirectoryPath $tempRootDirectory) {
-        Write-Host "临时目录未清理: 目录仍有内容: $tempRootDirectory" -ForegroundColor Yellow
-        return $false
-    }
-
-    Remove-Item -LiteralPath $tempRootDirectory -Force -ErrorAction SilentlyContinue
-    return -not (Test-Path -LiteralPath $tempRootDirectory)
 }
 
 # 先保存到脚本专属临时目录，确认生成成功后再移动为目标文件，减少半成品残留风险。
@@ -435,7 +385,7 @@ function New-TempOutputPath {
         [string]$TargetPath
     )
 
-    if (-not (Test-Path -LiteralPath $TempRootDirectory -PathType Container)) {
+    if (-not (Test-FileSystemDirectory -Path $TempRootDirectory)) {
         throw "临时目录不存在或不可用: $TempRootDirectory"
     }
 
@@ -451,13 +401,13 @@ function Remove-TempOutputFile {
         [string]$TempOutputPath
     )
 
-    if (-not (Test-Path -LiteralPath $TempOutputPath)) {
+    if (-not (Test-FileSystemPath -Path $TempOutputPath)) {
         return $true
     }
 
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         try {
-            Remove-Item -LiteralPath $TempOutputPath -Force -ErrorAction Stop
+            Remove-FileSystemItem -Path $TempOutputPath
             return $true
         }
         catch {
@@ -465,28 +415,35 @@ function Remove-TempOutputFile {
         }
     }
 
-    return -not (Test-Path -LiteralPath $TempOutputPath)
+    return -not (Test-FileSystemPath -Path $TempOutputPath)
 }
 
 # 根据临时输出文件路径清理其所在的空临时目录；如果里面还有文件则保留，避免误删用户内容。
 function Remove-TempOutputDirectoryIfEmpty {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TempOutputPath
+        [string]$TempOutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempRootDirectory
     )
 
     $tempDirectory = [System.IO.Path]::GetDirectoryName($TempOutputPath)
-    if ([string]::IsNullOrWhiteSpace($tempDirectory) -or -not (Test-Path -LiteralPath $tempDirectory)) {
+    if ([string]::IsNullOrWhiteSpace($tempDirectory) -or -not (Test-FileSystemPath -Path $tempDirectory)) {
         return
     }
 
-    if ([System.IO.Path]::GetFileName($tempDirectory) -ne $TempRootDirectoryName) {
+    $normalizedTempDirectory = ConvertTo-NormalizedPath -Path $tempDirectory
+    $normalizedTempRootDirectory = ConvertTo-NormalizedPath -Path $TempRootDirectory
+    if (-not $normalizedTempDirectory.Equals($normalizedTempRootDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
         return
     }
 
-    if ((Get-DirectoryItemCount -DirectoryPath $tempDirectory -TreatErrorAsNonEmpty) -eq 0) {
-        Remove-Item -LiteralPath $tempDirectory -Force -ErrorAction SilentlyContinue
-    }
+    $tempRootParentPath = Split-Path -Parent $TempRootDirectory
+    [void](Remove-EmptySiblingTempDirectory `
+            -TempDirectoryPath $TempRootDirectory `
+            -ParentPath $tempRootParentPath `
+            -TempDirectoryName $TempRootDirectoryName)
 }
 
 # 获取临时文件移动结果，确保目标文件存在，并尽量清理移动后仍残留的临时文件。
@@ -499,7 +456,7 @@ function Get-TempOutputMoveResult {
         [string]$TargetPath
     )
 
-    if (-not (Test-Path -LiteralPath $TargetPath)) {
+    if (-not (Test-FileSystemFile -Path $TargetPath)) {
         return [pscustomobject]@{
             IsValid     = $false
             HasWarning  = $false
@@ -508,7 +465,7 @@ function Get-TempOutputMoveResult {
         }
     }
 
-    if (Test-Path -LiteralPath $TempOutputPath) {
+    if (Test-FileSystemPath -Path $TempOutputPath) {
         if (-not (Remove-TempOutputFile -TempOutputPath $TempOutputPath)) {
             return [pscustomobject]@{
                 IsValid     = $true
@@ -568,6 +525,7 @@ function Get-OfficeApplication {
         }
         'PowerPoint' {
             $powerPoint = New-Object -ComObject PowerPoint.Application
+            # PowerPoint 使用 PpAlertLevel 枚举；1 表示 ppAlertsNone，和 Word/Excel 一样静默批量转换。
             $powerPoint.DisplayAlerts = 1
             $powerPoint
         }
@@ -594,7 +552,7 @@ function Convert-OfficeFile {
     $document = $null
 
     try {
-        if (Test-Path -LiteralPath $Plan.TargetPath) {
+        if (Test-FileSystemPath -Path $Plan.TargetPath) {
             return [pscustomobject]@{ Status = 'Skipped'; Message = '目标文件已存在' }
         }
 
@@ -618,7 +576,7 @@ function Convert-OfficeFile {
             }
         }
 
-        if (-not (Test-Path -LiteralPath $tempOutputPath)) {
+        if (-not (Test-FileSystemFile -Path $tempOutputPath)) {
             throw 'Office 未生成临时输出文件。'
         }
 
@@ -641,7 +599,7 @@ function Convert-OfficeFile {
 
         if (-not [string]::IsNullOrWhiteSpace($tempOutputPath)) {
             [void](Remove-TempOutputFile -TempOutputPath $tempOutputPath)
-            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
+            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath -TempRootDirectory $TempRootDirectory
         }
 
         return [pscustomobject]@{ Status = 'Failed'; Message = $_.Exception.Message }
@@ -712,9 +670,9 @@ function Move-ConvertedOfficeFileList {
         Write-ProgressBar -Activity '移动转换文件' -Status '正在移动文件' -ProcessedCount $processedCount -TotalCount $TempConversionResults.Count -LastPercent ([ref]$lastPercent)
         Start-Sleep -Milliseconds $FileMoveDelayMilliseconds
 
-        if (Test-Path -LiteralPath $plan.TargetPath) {
+        if (Test-FileSystemPath -Path $plan.TargetPath) {
             if (Remove-TempOutputFile -TempOutputPath $tempOutputPath) {
-                Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
+                Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath -TempRootDirectory $TempRootDirectory
                 $warningMessages.Add("跳过移动: $($plan.TargetPathText)`n  原因: 目标文件已存在，临时文件已清理")
             }
             else {
@@ -726,7 +684,7 @@ function Move-ConvertedOfficeFileList {
         }
 
         try {
-            Move-Item -LiteralPath $tempOutputPath -Destination $plan.TargetPath -ErrorAction Stop
+            [System.IO.File]::Move($tempOutputPath, $plan.TargetPath)
             $moveResult = Get-TempOutputMoveResult -TempOutputPath $tempOutputPath -TargetPath $plan.TargetPath
             if (-not $moveResult.IsValid) {
                 throw $moveResult.Message
@@ -736,7 +694,7 @@ function Move-ConvertedOfficeFileList {
                 $warningMessages.Add("移动完成但临时文件清理失败: $($plan.TargetPathText)`n  临时文件: $($moveResult.CleanupPath)")
             }
 
-            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath
+            Remove-TempOutputDirectoryIfEmpty -TempOutputPath $tempOutputPath -TempRootDirectory $TempRootDirectory
             $movedCount++
         }
         catch {
@@ -755,7 +713,7 @@ function Move-ConvertedOfficeFileList {
         Write-Host $failureMessage -ForegroundColor Red
     }
 
-    if (-not (Test-Path -LiteralPath $TempRootDirectory)) {
+    if (-not (Test-FileSystemPath -Path $TempRootDirectory)) {
         Write-Host "临时文件夹已清理。" -ForegroundColor Green
     }
 
@@ -769,7 +727,8 @@ function Move-ConvertedOfficeFileList {
 # 执行转换计划：先输出跳过项，再逐个转换待处理文件并汇总结果。
 function Invoke-ConversionPlanList {
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
         [string]$TempRootDirectory,
 
         [Parameter(Mandatory = $true)]
@@ -783,6 +742,10 @@ function Invoke-ConversionPlanList {
     $movedCount = 0
     $skippedCount = 0
     $failedCount = 0
+
+    if ($convertPlans.Count -gt 0 -and [string]::IsNullOrWhiteSpace($TempRootDirectory)) {
+        throw '存在待转换文件，但未提供可用的临时目录。'
+    }
 
     foreach ($plan in $skipPlans) {
         Write-Host "跳过: $($plan.TargetPathText)" -ForegroundColor Yellow
@@ -856,26 +819,26 @@ if ($Help) {
 if ($null -eq $PathList -or $PathList.Count -eq 0) {
     # 未传入路径时，引导用户输入文件或文件夹，直接回车则安全退出。
     Write-Host "请输入文件或目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车退出；输入 0 退出脚本。" -ForegroundColor DarkGray
-    $pathInputRaw = Read-ColoredLine -Prompt 'Path: '
-    if ($null -eq $pathInputRaw) {
+    $PathInputRaw = Read-ColoredLine -Prompt 'Path: '
+    if ($null -eq $PathInputRaw) {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
     }
 
-    $pathInput = $pathInputRaw.Trim()
-    if ([string]::IsNullOrWhiteSpace($pathInput)) {
+    $PathInput = $PathInputRaw.Trim()
+    if ([string]::IsNullOrWhiteSpace($PathInput)) {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
     }
 
-    if ($pathInput -eq '0') {
+    if ($PathInput -eq '0') {
         Write-Host "已退出，未执行扫描。" -ForegroundColor Yellow
         exit 0
     }
 
-    $PathList = @(Split-InteractivePathInput -PathInput $pathInput)
+    $PathList = @(Split-InteractivePathInput -PathInput $PathInput)
     if ($PathList.Count -gt 1) {
         Write-Host "识别到 $($PathList.Count) 个路径。" -ForegroundColor DarkGray
     }
@@ -883,55 +846,66 @@ if ($null -eq $PathList -or $PathList.Count -eq 0) {
 
 try {
     # 在正式扫描前集中校验路径，避免后续函数反复处理无效输入。
-    $effectivePathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($effectivePathList.Count -eq 0) {
+    $EffectivePathList = @($PathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($EffectivePathList.Count -eq 0) {
         Write-Host "未提供有效路径，已退出。" -ForegroundColor Yellow
         exit 0
     }
 
-    $resolvedInputItemList = @(Resolve-InputPathList -InputPathList $effectivePathList)
-    $conversionScopeList = @(New-ConversionScopeList -InputItemList $resolvedInputItemList)
+    $ResolvedInputItemList = @(Resolve-OfficeInputPathList -InputPathList $EffectivePathList)
+    $ConversionScopeList = @(New-ConversionScopeList -InputItemList $ResolvedInputItemList)
 }
 catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1
 }
 
-if ($conversionScopeList.Count -eq 0) {
+if ($ConversionScopeList.Count -eq 0) {
     Write-Host "未发现可处理的 .doc、.xls、.ppt 文件或目录。" -ForegroundColor Green
     exit 0
 }
 
-$processedSourcePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$scopeIndex = 0
-foreach ($conversionScope in $conversionScopeList) {
-    $scopeIndex++
-    if ($conversionScopeList.Count -gt 1) {
+$ProcessedSourcePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$FatalExitCode = 0
+$ScopeIndex = 0
+foreach ($ConversionScope in $ConversionScopeList) {
+    $ScopeIndex++
+    if ($ConversionScopeList.Count -gt 1) {
         Write-Host ""
-        Write-Host "转换范围 $scopeIndex / $($conversionScopeList.Count): $($conversionScope.Label)" -ForegroundColor Cyan
+        Write-Host "转换范围 $ScopeIndex / $($ConversionScopeList.Count): $($ConversionScope.Label)" -ForegroundColor Cyan
     }
 
+    $TempRootDirectory = $null
     try {
-        $tempRootDirectory = Initialize-TempRootDirectory -RootPath $conversionScope.RootPath
-    }
-    catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        exit 1
-    }
-
-    try {
-        $sourceFileList = if ($null -eq $conversionScope.SourceFileList) { $null } else { $conversionScope.SourceFileList.ToArray() }
-        $conversionPlans = @(New-ConversionPlanList -RootPath $conversionScope.RootPath -SourceFileList $sourceFileList -ProcessedSourcePathSet $processedSourcePathSet)
-        if ($conversionPlans.Count -eq 0) {
-            # 没有可处理文件时直接成功结束，但仍会在 finally 中清理空临时目录。
+        $SourceFileList = if ($null -eq $ConversionScope.SourceFileList) { $null } else { $ConversionScope.SourceFileList.ToArray() }
+        $ConversionPlans = @(New-ConversionPlanList -RootPath $ConversionScope.RootPath -SourceFileList $SourceFileList -ProcessedSourcePathSet $ProcessedSourcePathSet)
+        if ($ConversionPlans.Count -eq 0) {
             Write-Host "未发现 .doc、.xls、.ppt 旧格式 Office 文件。" -ForegroundColor Green
         }
         else {
-            [void](Write-ConversionPlanSummary -ConversionPlans $conversionPlans)
-            Invoke-ConversionPlanList -TempRootDirectory $tempRootDirectory -ConversionPlans $conversionPlans
+            $ConvertPlanCount = Write-ConversionPlanSummary -ConversionPlans $ConversionPlans
+            if ($ConvertPlanCount -gt 0) {
+                $TempRootDirectory = Initialize-TempRootDirectory -RootPath $ConversionScope.RootPath
+            }
+
+            Invoke-ConversionPlanList -TempRootDirectory $TempRootDirectory -ConversionPlans $ConversionPlans
         }
     }
-    finally {
-        [void](Remove-TempRootDirectoryIfEmpty -RootPath $conversionScope.RootPath)
+    catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        $FatalExitCode = 1
     }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($TempRootDirectory)) {
+            [void](Remove-TempRootDirectoryIfEmpty -TempRootDirectory $TempRootDirectory)
+        }
+    }
+
+    if ($FatalExitCode -ne 0) {
+        break
+    }
+}
+
+if ($FatalExitCode -ne 0) {
+    exit $FatalExitCode
 }

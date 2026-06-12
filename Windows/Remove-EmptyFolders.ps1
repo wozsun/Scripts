@@ -53,7 +53,7 @@ function Show-HelpText {
   pwsh -File .\Remove-EmptyFolders.ps1 [-s] [-yes] [Path1] [Path2 ...]
 
 参数：
-  Path   一个或多个文件夹绝对路径；未提供时会引导交互输入；路径含空格请使用英文引号。
+  Path   一个或多个文件夹绝对路径；未提供时会引导交互输入；路径含空格时，请使用英文引号包裹路径。
   -s     把隐藏文件夹也作为删除候选；空目录判断始终会检查隐藏项和系统项。
   -yes   跳过详细预览和菜单，输出汇总后等待 10 秒，再执行默认删除。
   -h     显示帮助信息。
@@ -65,64 +65,6 @@ function Show-HelpText {
 '@
 }
 
-# 校验并解析单个输入目录。
-function Resolve-InputDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RawPath
-    )
-
-    $cleanPath = ConvertTo-UnquotedPathText -PathText $RawPath
-    if ([string]::IsNullOrWhiteSpace($cleanPath)) {
-        return [pscustomobject]@{
-            Success = $false
-            Path    = $null
-            Error   = '路径为空。'
-        }
-    }
-
-    try {
-        if (-not [System.IO.Path]::IsPathFullyQualified($cleanPath)) {
-            return [pscustomobject]@{
-                Success = $false
-                Path    = $null
-                Error   = '请输入存在的 Windows 文件夹绝对路径。'
-            }
-        }
-    }
-    catch {
-        return [pscustomobject]@{
-            Success = $false
-            Path    = $null
-            Error   = '路径格式无效。'
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $cleanPath -PathType Container)) {
-        return [pscustomobject]@{
-            Success = $false
-            Path    = $null
-            Error   = '文件夹不存在。'
-        }
-    }
-
-    try {
-        $resolvedPath = (Resolve-Path -LiteralPath $cleanPath -ErrorAction Stop).ProviderPath
-        return [pscustomobject]@{
-            Success = $true
-            Path    = (Get-DirectoryKey -DirectoryPath $resolvedPath)
-            Error   = $null
-        }
-    }
-    catch {
-        return [pscustomobject]@{
-            Success = $false
-            Path    = $null
-            Error   = $_.Exception.Message
-        }
-    }
-}
-
 # 校验一批输入目录；同一批输入只要有错误，本批路径都不保留。
 function Resolve-InputDirectoryList {
     param(
@@ -132,44 +74,39 @@ function Resolve-InputDirectoryList {
         [string[]]$ExistingPathList = @()
     )
 
-    $resolvedPathList = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($rawPath in $RawPathList) {
-        $resolvedResult = Resolve-InputDirectory -RawPath $rawPath
-        if (-not $resolvedResult.Success) {
-            return [pscustomobject]@{
-                Success = $false
-                Paths   = @()
-                Error   = "路径无效: $rawPath。$($resolvedResult.Error) 本次输入不保留。"
-            }
+    $resolvedResult = common\Resolve-IndependentInputDirectoryList `
+        -PathList $RawPathList `
+        -ExistingDirectoryPathList $ExistingPathList
+    if (-not $resolvedResult.Success) {
+        $errorMessage = if ($resolvedResult.Error -eq '目录不能互为父子目录。') {
+            '路径无效，请不要输入父子目录。'
+        }
+        else {
+            $resolvedResult.Error
         }
 
-        foreach ($existingPath in $ExistingPathList) {
-            if (Test-DirectoryOverlap -LeftPath $resolvedResult.Path -RightPath $existingPath) {
+        return [pscustomobject]@{
+            Success = $false
+            Paths   = @()
+            Error   = "$errorMessage 本次输入不保留。"
+        }
+    }
+
+    if (-not $IncludeHiddenFolderCandidates) {
+        foreach ($resolvedItem in @($resolvedResult.Items)) {
+            if (Test-HiddenFileSystemItem -Item $resolvedItem) {
                 return [pscustomobject]@{
                     Success = $false
                     Paths   = @()
-                    Error   = '路径无效，请不要重复输入或输入互相包含的目录。本次输入不保留。'
+                    Error   = "路径无效: $($resolvedItem.FullName) 是隐藏文件夹；如需处理隐藏项，请传入 -s。本次输入不保留。"
                 }
             }
         }
-
-        foreach ($newPath in $resolvedPathList) {
-            if (Test-DirectoryOverlap -LeftPath $resolvedResult.Path -RightPath $newPath) {
-                return [pscustomobject]@{
-                    Success = $false
-                    Paths   = @()
-                    Error   = '路径无效，请不要重复输入或输入互相包含的目录。本次输入不保留。'
-                }
-            }
-        }
-
-        $resolvedPathList.Add($resolvedResult.Path)
     }
 
     return [pscustomobject]@{
         Success = $true
-        Paths   = @($resolvedPathList.ToArray())
+        Paths   = @($resolvedResult.Paths)
         Error   = $null
     }
 }
@@ -177,7 +114,7 @@ function Resolve-InputDirectoryList {
 # 交互读取一个或多个目录路径。
 function Read-InteractiveDirectoryList {
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行或退出；输入 0 退出脚本。" -ForegroundColor DarkGray
 
     $pathList = [System.Collections.Generic.List[string]]::new()
@@ -217,8 +154,11 @@ function Read-InteractiveDirectoryList {
         }
 
         $resolvedPathCount = @($resolvedResult.Paths).Count
-        if ($resolvedPathCount -gt 1) {
-            Write-Host "识别到 $resolvedPathCount 个路径。" -ForegroundColor DarkGray
+        if ($resolvedPathCount -eq 0) {
+            Write-Host "输入路径已存在，本次未新增。" -ForegroundColor DarkGray
+        }
+        elseif ($rawPathList.Count -gt 1) {
+            Write-Host "识别到 $resolvedPathCount 个新路径。" -ForegroundColor DarkGray
         }
     }
 }
@@ -229,13 +169,17 @@ function Test-DirectoryWillBeEmpty {
         [Parameter(Mandatory = $true)]
         [string]$DirectoryPath,
 
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[string]]$PlannedDirectoryKeySet,
 
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[object]]$ErrorList
     )
 
     try {
-        $childItems = @(Get-ChildItem -LiteralPath $DirectoryPath -Force -ErrorAction Stop)
+        $childItems = @(Get-DirectoryChildItemList -DirectoryPath $DirectoryPath -ResolvedDirectoryPath $DirectoryPath)
     }
     catch {
         $ErrorList.Add([pscustomobject]@{
@@ -247,7 +191,7 @@ function Test-DirectoryWillBeEmpty {
     }
 
     foreach ($childItem in $childItems) {
-        if ($childItem.PSIsContainer) {
+        if ($childItem -is [System.IO.DirectoryInfo]) {
             $childKey = Get-DirectoryKey -DirectoryPath $childItem.FullName
             if ($PlannedDirectoryKeySet.Contains($childKey)) {
                 continue
@@ -471,6 +415,144 @@ function Read-ManualDeletionSelection {
     }
 }
 
+# 将 Windows 路径转换为扩展长度路径，用于兜底处理末尾空格等普通 Win32 路径难以删除的目录。
+function ConvertTo-ExtendedLengthPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {
+        return $Path
+    }
+
+    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        $trimmedPath = $Path.TrimStart([char[]]@('\', '/'))
+        return "\\?\UNC\$trimmedPath"
+    }
+
+    return "\\?\$Path"
+}
+
+# 普通 Test-Path 失败时使用扩展路径重试，避免异常目录名被误判为不存在。
+function Resolve-DeletionDirectoryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath
+    )
+
+    try {
+        if ([System.IO.Directory]::Exists($DirectoryPath)) {
+            return [pscustomobject]@{
+                Exists       = $true
+                Path         = $DirectoryPath
+                UsedExtended = $false
+            }
+        }
+    }
+    catch {
+        # 继续走扩展路径兜底。
+        Write-Debug "普通路径目录检测失败，准备使用扩展路径兜底: $DirectoryPath。原因: $($_.Exception.Message)"
+    }
+
+    $extendedPath = ConvertTo-ExtendedLengthPath -Path $DirectoryPath
+    if (-not $extendedPath.Equals($DirectoryPath, [System.StringComparison]::Ordinal)) {
+        try {
+            if ([System.IO.Directory]::Exists($extendedPath)) {
+                return [pscustomobject]@{
+                    Exists       = $true
+                    Path         = $extendedPath
+                    UsedExtended = $true
+                }
+            }
+        }
+        catch {
+            # 统一返回不存在，由调用方按跳过处理。
+            Write-Debug "扩展路径目录检测失败: $extendedPath。原因: $($_.Exception.Message)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Exists       = $false
+        Path         = $DirectoryPath
+        UsedExtended = $false
+    }
+}
+
+# 读取目录子项；普通路径失败时使用扩展路径兜底。
+function Get-DirectoryChildItemList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedDirectoryPath
+    )
+
+    try {
+        return @(([System.IO.DirectoryInfo]::new($ResolvedDirectoryPath)).EnumerateFileSystemInfos())
+    }
+    catch {
+        $extendedPath = ConvertTo-ExtendedLengthPath -Path $DirectoryPath
+        if ($extendedPath.Equals($ResolvedDirectoryPath, [System.StringComparison]::Ordinal)) {
+            throw
+        }
+
+        return @(([System.IO.DirectoryInfo]::new($extendedPath)).EnumerateFileSystemInfos())
+    }
+}
+
+# 删除前读取第一个子项；普通路径失败时再用扩展路径兜底，失败则不删除。
+function Get-FirstDirectoryChildItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedDirectoryPath
+    )
+
+    foreach ($childItem in (Get-DirectoryChildItemList -DirectoryPath $DirectoryPath -ResolvedDirectoryPath $ResolvedDirectoryPath)) {
+        return $childItem
+    }
+
+    return $null
+}
+
+# 删除空目录；普通路径删除失败时，用扩展路径重新确认为空后再删除。
+function Remove-EmptyDirectoryWithFallback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedDirectoryPath
+    )
+
+    try {
+        [System.IO.Directory]::Delete($ResolvedDirectoryPath)
+        return
+    }
+    catch {
+        $extendedPath = ConvertTo-ExtendedLengthPath -Path $DirectoryPath
+        if ($extendedPath.Equals($ResolvedDirectoryPath, [System.StringComparison]::Ordinal)) {
+            throw
+        }
+
+        $firstChild = $null
+        foreach ($childPath in [System.IO.Directory]::EnumerateFileSystemEntries($extendedPath)) {
+            $firstChild = $childPath
+            break
+        }
+
+        if ($null -ne $firstChild) {
+            throw '目录当前不是空文件夹。'
+        }
+
+        [System.IO.Directory]::Delete($extendedPath)
+    }
+}
+
 # 删除选定的空文件夹。
 function Invoke-EmptyFolderDeletion {
     param(
@@ -498,7 +580,8 @@ function Invoke-EmptyFolderDeletion {
         $currentIndex++
         Write-ProgressBar -Activity $activity -Status '正在删除空文件夹' -ProcessedCount $currentIndex -TotalCount $orderedTargetList.Count -LastPercent ([ref]$lastDeletionPercent)
 
-        if (-not (Test-Path -LiteralPath $targetDirectory.FullName -PathType Container)) {
+        $directoryPathState = Resolve-DeletionDirectoryPath -DirectoryPath $targetDirectory.FullName
+        if (-not $directoryPathState.Exists) {
             $skippedList.Add([pscustomobject]@{
                     Path    = $targetDirectory.FullName
                     Message = '目录已不存在。'
@@ -507,7 +590,9 @@ function Invoke-EmptyFolderDeletion {
         }
 
         try {
-            $firstChild = Get-ChildItem -LiteralPath $targetDirectory.FullName -Force -ErrorAction Stop | Select-Object -First 1
+            $firstChild = Get-FirstDirectoryChildItem `
+                -DirectoryPath $targetDirectory.FullName `
+                -ResolvedDirectoryPath $directoryPathState.Path
             if ($null -ne $firstChild) {
                 $skippedList.Add([pscustomobject]@{
                         Path    = $targetDirectory.FullName
@@ -516,7 +601,9 @@ function Invoke-EmptyFolderDeletion {
                 continue
             }
 
-            Remove-Item -LiteralPath $targetDirectory.FullName -Force -ErrorAction Stop
+            Remove-EmptyDirectoryWithFallback `
+                -DirectoryPath $targetDirectory.FullName `
+                -ResolvedDirectoryPath $directoryPathState.Path
             $deletedList.Add($targetDirectory.FullName)
         }
         catch {
@@ -576,20 +663,20 @@ if ($null -eq $PathList -or $PathList.Count -eq 0) {
     $RootPathList = @(Read-InteractiveDirectoryList)
 }
 else {
-    $resolvedPathResult = Resolve-InputDirectoryList -RawPathList $PathList
-    if (-not $resolvedPathResult.Success) {
-        Write-Host $resolvedPathResult.Error -ForegroundColor Red
+    $ResolvedPathResult = Resolve-InputDirectoryList -RawPathList $PathList
+    if (-not $ResolvedPathResult.Success) {
+        Write-Host $ResolvedPathResult.Error -ForegroundColor Red
         exit 1
     }
 
-    $RootPathList = @($resolvedPathResult.Paths)
+    $RootPathList = @($ResolvedPathResult.Paths)
 }
 
 Write-StageMessage "开始扫描输入目录，数量: $($RootPathList.Count)"
-$deletionPlanResult = New-EmptyFolderDeletionPlan -RootPathList $RootPathList
-$DeletionPlanList = @($deletionPlanResult.Items)
+$DeletionPlanResult = New-EmptyFolderDeletionPlan -RootPathList $RootPathList
+$DeletionPlanList = @($DeletionPlanResult.Items)
 
-Write-ErrorRecordList -ErrorRecordList @($deletionPlanResult.Errors)
+Write-ErrorRecordList -ErrorRecordList @($DeletionPlanResult.Errors)
 
 if ($DeletionPlanList.Count -eq 0) {
     Write-Host
@@ -602,25 +689,29 @@ if ($AssumeYes) {
     Write-Host -NoNewline "扫描完成。默认计划删除空文件夹数: " -ForegroundColor White
     Write-Host $DeletionPlanList.Count -ForegroundColor Magenta
 
-    if (Wait-AssumeYesDeletionGracePeriod `
+    if (Wait-DangerousOperationGracePeriod `
             -WarningMessage '已启用 -yes，将跳过详细预览并执行默认删除。' `
             -AdditionalWarningMessage "计划删除空文件夹数: $($DeletionPlanList.Count)" `
-            -CancelledMessage '已取消默认删除。') {
+            -CancelledMessage '已取消默认删除。' `
+            -CompletedMessage '倒计时结束，开始执行默认删除。' `
+            -CountdownMessageFormat '倒计时 {0} 秒后开始删除，按 Enter 取消...') {
         Invoke-EmptyFolderDeletion -TargetDirectoryList $DeletionPlanList
     }
     exit 0
 }
 
 Write-DeletionPreview -DeletionPlanList $DeletionPlanList
-$operationChoice = Read-OperationChoice
+$OperationChoice = Read-OperationChoice
 
-switch ($operationChoice) {
+switch ($OperationChoice) {
     'Default' {
         Invoke-EmptyFolderDeletion -TargetDirectoryList $DeletionPlanList
     }
     'Manual' {
-        $selectedDeletionList = @(Read-ManualDeletionSelection -DeletionPlanList $DeletionPlanList)
-        Invoke-EmptyFolderDeletion -TargetDirectoryList $selectedDeletionList
+        $SelectedDeletionList = @(Read-ManualDeletionSelection -DeletionPlanList $DeletionPlanList)
+        if ($SelectedDeletionList.Count -gt 0) {
+            Invoke-EmptyFolderDeletion -TargetDirectoryList $SelectedDeletionList
+        }
     }
     'Exit' {
         Write-Host "已退出，未删除任何文件夹。" -ForegroundColor Yellow

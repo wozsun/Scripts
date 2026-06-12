@@ -18,6 +18,9 @@ $script:ProgressBarFilledCharacter = '#'
 # 进度条未完成部分使用的字符；和已完成字符保持同宽，动态刷新时不容易抖动。
 $script:ProgressBarEmptyCharacter = '-'
 
+# 进度条同百分比状态下的强制刷新间隔；设为 0 或负数则只在百分比变化时刷新。
+$script:ProgressBarTimedRefreshMilliseconds = 1000
+
 # 预览分隔线长度；用于重复文件组、扫描阶段等块状输出的视觉分隔。
 $script:PreviewSeparatorCellCount = 64
 
@@ -30,14 +33,18 @@ $script:AssumeYesGraceSeconds = 10
 # -yes 倒计时期间检查键盘输入的间隔；越小响应越快，但会更频繁轮询控制台。
 $script:AssumeYesInputPollIntervalMilliseconds = 100
 
-# ========== 内部状态变量 ==========
+# ========== 运行状态 ==========
 # 以下变量由函数内部维护，用于跨调用追踪动态输出状态；请勿手动修改。
 
-# 上一次动态状态行的显示宽度；用于本次刷新时清掉旧尾巴。
-$script:DynamicStatusLastCellWidth = 0
-
-# 记录上一条动态状态是否真的以内联方式输出；输出重定向或降级时不额外补换行。
-$script:DynamicStatusLastWriteWasInline = $false
+# 输出相关运行状态；由动态状态行和进度条函数维护，请勿手动修改。
+$script:OutputRuntimeState = [pscustomobject]@{
+    # 上一次动态状态行的显示宽度；用于本次刷新时清掉旧尾巴。
+    DynamicStatusLastCellWidth            = 0
+    # 记录上一条动态状态是否真的以内联方式输出；输出重定向或降级时不额外补换行。
+    DynamicStatusLastWriteWasInline       = $false
+    # 记录各进度条最近一次刷新时间；用于同百分比但耗时较长时按间隔刷新计数。
+    ProgressBarLastRefreshMillisecondsByKey  = @{}
+}
 
 # 输出当前执行阶段，避免大目录扫描时长时间无反馈。
 function Write-StageMessage {
@@ -183,7 +190,7 @@ function Get-ConsoleTextWidth {
     return (Get-ConsoleTextWithinCellWidth -Text $Text -MaxCellWidth ([int]::MaxValue)).CellWidth
 }
 
-# 刷新单行动态状态；不使用 SetCursorPosition，避免光标定位失败后停在补空格末尾。
+# 刷新单行动态状态；写完整行后回到行首，减少行尾光标闪烁。
 function Write-DynamicStatusLine {
     param(
         [Parameter(Mandatory = $true)]
@@ -200,8 +207,8 @@ function Write-DynamicStatusLine {
         if ([Console]::IsOutputRedirected) {
             Complete-DynamicStatusLine
             Write-Host $statusMessage -ForegroundColor $Color
-            $script:DynamicStatusLastCellWidth = 0
-            $script:DynamicStatusLastWriteWasInline = $false
+            $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+            $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
             return
         }
 
@@ -209,37 +216,36 @@ function Write-DynamicStatusLine {
         $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
         $lineText = Get-ConsoleTextWithinCellWidth -Text $statusMessage -MaxCellWidth $maxLineWidth
 
-        # 先写“当前文本 + 必要补空格”清除上一条长文本尾巴，再回到行首写当前文本。
-        # 这样光标自然停在当前文本末尾，不依赖宿主是否支持 SetCursorPosition。
-        $clearWidth = [Math]::Min($maxLineWidth, [Math]::Max($script:DynamicStatusLastCellWidth, $lineText.CellWidth))
+        # 写“当前文本 + 必要补空格”清除上一条长文本尾巴，结尾回到行首等待下次覆盖。
+        $clearWidth = [Math]::Min($maxLineWidth, [Math]::Max($script:OutputRuntimeState.DynamicStatusLastCellWidth, $lineText.CellWidth))
         $paddingWidth = [Math]::Max(0, $clearWidth - $lineText.CellWidth)
         $paddingText = ' ' * $paddingWidth
-        Write-Host -NoNewline "`r$($lineText.Text)$paddingText`r$($lineText.Text)" -ForegroundColor $Color
+        Write-Host -NoNewline "`r$($lineText.Text)$paddingText`r" -ForegroundColor $Color
 
-        $script:DynamicStatusLastCellWidth = $lineText.CellWidth
-        $script:DynamicStatusLastWriteWasInline = $true
+        $script:OutputRuntimeState.DynamicStatusLastCellWidth = $lineText.CellWidth
+        $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $true
         return
     }
     catch {
         # 某些宿主不支持读取控制台宽度；静默降级为普通整行输出，避免异常打断进度行。
         Complete-DynamicStatusLine
         Write-Host $statusMessage -ForegroundColor $Color
-        $script:DynamicStatusLastCellWidth = 0
-        $script:DynamicStatusLastWriteWasInline = $false
+        $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+        $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
     }
 }
 
 # 结束当前动态状态行；只有确实使用了内联刷新时才补换行。
 function Complete-DynamicStatusLine {
-    if ($script:DynamicStatusLastWriteWasInline) {
+    if ($script:OutputRuntimeState.DynamicStatusLastWriteWasInline) {
         Write-Host ""
     }
 
-    $script:DynamicStatusLastCellWidth = 0
-    $script:DynamicStatusLastWriteWasInline = $false
+    $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+    $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
 }
 
-# 更新百分比进度条；调用方通过 ref 记录上次百分比，避免重复刷新。
+# 更新百分比进度条；百分比变化或同百分比超过配置间隔时刷新，避免长任务看起来卡住。
 function Write-ProgressBar {
     param(
         [Parameter(Mandatory = $true)]
@@ -266,8 +272,19 @@ function Write-ProgressBar {
     }
 
     $percent = [Math]::Min(100, [int][Math]::Floor(($ProcessedCount / $TotalCount) * 100))
-    # 大目录扫描时大量重复绘制会明显拖慢输出；百分比变化时再刷新即可。
-    if (-not $Force -and $percent -eq $LastPercent.Value) {
+    $refreshKey = "$Activity`0$Status"
+    $currentMilliseconds = [long]([DateTime]::UtcNow.Ticks / [TimeSpan]::TicksPerMillisecond)
+    $refreshIntervalMilliseconds = [Math]::Max(0, [int]$script:ProgressBarTimedRefreshMilliseconds)
+    $shouldRefreshByPercent = ($percent -ne $LastPercent.Value)
+    $shouldRefreshByTime = $false
+
+    if ($refreshIntervalMilliseconds -gt 0 -and $script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey.ContainsKey($refreshKey)) {
+        $lastRefreshMilliseconds = [long]$script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey[$refreshKey]
+        $shouldRefreshByTime = (($currentMilliseconds - $lastRefreshMilliseconds) -ge $refreshIntervalMilliseconds)
+    }
+
+    # 大目录扫描时大量重复绘制会明显拖慢输出；百分比变化或同百分比超过配置间隔时再刷新。
+    if (-not $Force -and -not $shouldRefreshByPercent -and -not $shouldRefreshByTime) {
         return
     }
 
@@ -278,6 +295,7 @@ function Write-ProgressBar {
 
     Write-DynamicStatusLine -Message $progressText -Color Cyan
     $LastPercent.Value = $percent
+    $script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey[$refreshKey] = $currentMilliseconds
 }
 
 # 使用同一行刷新状态，适合“正在处理 -> 处理完成”这种短状态。
@@ -359,11 +377,11 @@ function Test-EnterKeyPressed {
     return $false
 }
 
-# -yes 会跳过人工确认，因此执行删除前提供醒目的中止窗口。
-function Wait-AssumeYesDeletionGracePeriod {
+# 危险操作执行前提供醒目的中止窗口，调用方负责传入符合具体操作的提示文本。
+function Wait-DangerousOperationGracePeriod {
     param(
-        [Parameter(Mandatory = $false)]
-        [string]$WarningMessage = '危险操作: 已启用 -yes，将跳过详细预览和菜单并执行默认删除。',
+        [Parameter(Mandatory = $true)]
+        [string]$WarningMessage,
 
         [Parameter(Mandatory = $false)]
         [AllowEmptyString()]
@@ -372,11 +390,14 @@ function Wait-AssumeYesDeletionGracePeriod {
         [Parameter(Mandatory = $false)]
         [string]$CancelHintMessage = '如需取消，请在倒计时结束前按 Enter；也可按 Ctrl+C 强制中止。',
 
-        [Parameter(Mandatory = $false)]
-        [string]$CancelledMessage = '已取消 -yes 默认删除，未删除任何项目。',
+        [Parameter(Mandatory = $true)]
+        [string]$CancelledMessage,
 
-        [Parameter(Mandatory = $false)]
-        [string]$CompletedMessage = '倒计时结束，开始执行默认删除。'
+        [Parameter(Mandatory = $true)]
+        [string]$CompletedMessage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CountdownMessageFormat
     )
 
     # 这里只负责“等待并返回是否继续”。具体取消后是退出本轮还是退出进程，由调用方决定。
@@ -391,7 +412,7 @@ function Wait-AssumeYesDeletionGracePeriod {
     $pollInterval = [Math]::Max(1, $script:AssumeYesInputPollIntervalMilliseconds)
     $pollCountPerSecond = [Math]::Max(1, [int][Math]::Ceiling(1000 / $pollInterval))
     for ($remainingSeconds = $script:AssumeYesGraceSeconds; $remainingSeconds -gt 0; $remainingSeconds--) {
-        Write-DynamicStatusLine -Message "倒计时 $remainingSeconds 秒后开始删除，按 Enter 取消..." -Color Yellow
+        Write-DynamicStatusLine -Message ($CountdownMessageFormat -f $remainingSeconds) -Color Yellow
 
         # 每秒拆成多个短 sleep，保证按 Enter 后能较快响应。
         for ($pollIndex = 0; $pollIndex -lt $pollCountPerSecond; $pollIndex++) {
@@ -474,6 +495,370 @@ function Write-DeferredScanWarningList {
     }
 }
 
+# 判断文件路径是否存在；使用 .NET 避免 Test-Path 的管道和 Provider 开销。
+function Test-FileSystemFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return [System.IO.File]::Exists($Path)
+}
+
+# 判断目录路径是否存在；使用 .NET 避免 Test-Path 的管道和 Provider 开销。
+function Test-FileSystemDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return [System.IO.Directory]::Exists($Path)
+}
+
+# 判断文件或目录路径是否存在。
+function Test-FileSystemPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return ((Test-FileSystemFile -Path $Path) -or (Test-FileSystemDirectory -Path $Path))
+}
+
+# 获取文件系统对象；路径不存在时返回 null。
+function Get-FileSystemItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if ([System.IO.Directory]::Exists($fullPath)) {
+        return [System.IO.DirectoryInfo]::new($fullPath)
+    }
+
+    if ([System.IO.File]::Exists($fullPath)) {
+        return [System.IO.FileInfo]::new($fullPath)
+    }
+
+    return $null
+}
+
+# 创建目录并返回 DirectoryInfo。
+function New-FileSystemDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return [System.IO.Directory]::CreateDirectory($Path)
+}
+
+# 删除文件或目录；删除前尽量移除常见保护属性，适合清理脚本临时目录和临时文件。
+function Remove-FileSystemItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Recurse
+    )
+
+    if ([System.IO.File]::Exists($Path)) {
+        [System.IO.File]::SetAttributes($Path, [System.IO.FileAttributes]::Normal)
+        [System.IO.File]::Delete($Path)
+        if ([System.IO.File]::Exists($Path)) {
+            throw "删除后文件仍存在: $Path"
+        }
+
+        return
+    }
+
+    if (-not [System.IO.Directory]::Exists($Path)) {
+        return
+    }
+
+    $directoryInfo = [System.IO.DirectoryInfo]::new($Path)
+    $attributesToClear = [int](
+        [System.IO.FileAttributes]::ReadOnly -bor
+        [System.IO.FileAttributes]::Hidden -bor
+        [System.IO.FileAttributes]::System
+    )
+
+    if ($Recurse) {
+        foreach ($childFile in $directoryInfo.EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)) {
+            try {
+                $childFile.Attributes = [System.IO.FileAttributes]::Normal
+            }
+            catch {
+                # 删除时会再次抛出真实错误；这里不提前中断。
+                Write-Debug "清理文件属性失败: $($childFile.FullName)。原因: $($_.Exception.Message)"
+            }
+        }
+
+        foreach ($childDirectory in $directoryInfo.EnumerateDirectories('*', [System.IO.SearchOption]::AllDirectories)) {
+            try {
+                $childDirectory.Attributes = [System.IO.FileAttributes](([int]$childDirectory.Attributes) -band (-bnot $attributesToClear))
+            }
+            catch {
+                # 删除时会再次抛出真实错误；这里不提前中断。
+                Write-Debug "清理目录属性失败: $($childDirectory.FullName)。原因: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    try {
+        $directoryInfo.Attributes = [System.IO.FileAttributes](([int]$directoryInfo.Attributes) -band (-bnot $attributesToClear))
+    }
+    catch {
+        # 删除时会再次抛出真实错误；这里不提前中断。
+        Write-Debug "清理目录属性失败: $Path。原因: $($_.Exception.Message)"
+    }
+
+    [System.IO.Directory]::Delete($Path, [bool]$Recurse)
+    if ([System.IO.Directory]::Exists($Path)) {
+        throw "删除后目录仍存在: $Path"
+    }
+}
+
+# 获取目录中的项目数量；可选择在扫描失败时按非空处理，适合临时目录安全判断。
+function Get-DirectoryItemCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$TreatErrorAsNonEmpty
+    )
+
+    try {
+        $itemCount = 0
+        foreach ($itemPath in [System.IO.Directory]::EnumerateFileSystemEntries($DirectoryPath)) {
+            $itemCount++
+        }
+
+        return $itemCount
+    }
+    catch {
+        if ($TreatErrorAsNonEmpty) {
+            return 1
+        }
+
+        throw
+    }
+}
+
+# 校验脚本专属临时目录名，避免调用方传入路径导致清理越界。
+function Assert-SiblingTempDirectoryName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TempDirectoryName)) {
+        throw '临时目录名不能为空。'
+    }
+
+    if ([System.IO.Path]::IsPathRooted($TempDirectoryName) -or
+        $TempDirectoryName.Contains([System.IO.Path]::DirectorySeparatorChar) -or
+        $TempDirectoryName.Contains([System.IO.Path]::AltDirectorySeparatorChar)) {
+        throw "临时目录名不能包含路径或路径分隔符: $TempDirectoryName"
+    }
+
+    if ($TempDirectoryName.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw "临时目录名包含非法字符: $TempDirectoryName"
+    }
+}
+
+# 获取同目录下的脚本专属临时目录路径。
+function Get-SiblingTempDirectoryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    Assert-SiblingTempDirectoryName -TempDirectoryName $TempDirectoryName
+    return [System.IO.Path]::Combine($ParentPath, $TempDirectoryName)
+}
+
+# 判断目录名是否为脚本专属临时目录名。
+function Test-SiblingTempDirectoryName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    Assert-SiblingTempDirectoryName -TempDirectoryName $TempDirectoryName
+    if ([string]::IsNullOrWhiteSpace($DirectoryName)) {
+        return $false
+    }
+
+    return $DirectoryName.Equals($TempDirectoryName, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# 判断路径是否为指定父目录下的脚本专属临时目录。
+function Test-SiblingTempDirectoryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    Assert-SiblingTempDirectoryName -TempDirectoryName $TempDirectoryName
+
+    try {
+        $actualPath = ConvertTo-NormalizedPath -Path $Path
+        $actualParentPath = [System.IO.Path]::GetDirectoryName($actualPath)
+        if ([string]::IsNullOrWhiteSpace($actualParentPath)) {
+            return $false
+        }
+
+        $actualParentKey = ConvertTo-NormalizedPath -Path $actualParentPath
+        $expectedParentKey = ConvertTo-NormalizedPath -Path $ParentPath
+        if (-not $actualParentKey.Equals($expectedParentKey, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        $actualDirectoryName = [System.IO.Path]::GetFileName($actualPath)
+        return Test-SiblingTempDirectoryName -DirectoryName $actualDirectoryName -TempDirectoryName $TempDirectoryName
+    }
+    catch {
+        return $false
+    }
+}
+
+# 创建同目录脚本专属临时目录；已存在的专属临时目录会被清空并复用。
+function Initialize-SiblingTempDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    if (-not (Test-FileSystemDirectory -Path $ParentPath)) {
+        throw "临时目录父目录不存在或不可用: $ParentPath"
+    }
+
+    $tempDirectoryPath = Get-SiblingTempDirectoryPath -ParentPath $ParentPath -TempDirectoryName $TempDirectoryName
+    if (Test-FileSystemFile -Path $tempDirectoryPath) {
+        throw "临时目录路径被同名文件占用: $tempDirectoryPath"
+    }
+
+    if (Test-FileSystemDirectory -Path $tempDirectoryPath) {
+        Clear-SiblingTempDirectoryContents `
+            -TempDirectoryPath $tempDirectoryPath `
+            -ParentPath $ParentPath `
+            -TempDirectoryName $TempDirectoryName
+        return (Get-FileSystemItem -Path $tempDirectoryPath).FullName
+    }
+
+    return (New-FileSystemDirectory -Path $tempDirectoryPath).FullName
+}
+
+# 清空脚本专属临时目录内容；调用前会校验目录名，避免清空普通目录。
+function Clear-SiblingTempDirectoryContents {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    if (Test-FileSystemFile -Path $TempDirectoryPath) {
+        throw "临时路径不是文件夹: $TempDirectoryPath"
+    }
+
+    if (-not (Test-FileSystemDirectory -Path $TempDirectoryPath)) {
+        return
+    }
+
+    if (-not (Test-SiblingTempDirectoryPath -Path $TempDirectoryPath -ParentPath $ParentPath -TempDirectoryName $TempDirectoryName)) {
+        throw "拒绝清理非脚本临时目录: $TempDirectoryPath"
+    }
+
+    foreach ($childItem in ([System.IO.DirectoryInfo]::new($TempDirectoryPath)).EnumerateFileSystemInfos()) {
+        Remove-FileSystemItem -Path $childItem.FullName -Recurse
+    }
+}
+
+# 删除脚本专属临时目录；调用前会校验目录名，避免删除普通目录。
+function Remove-SiblingTempDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    if (-not (Test-FileSystemPath -Path $TempDirectoryPath)) {
+        return
+    }
+
+    if (Test-FileSystemFile -Path $TempDirectoryPath) {
+        throw "临时路径不是文件夹: $TempDirectoryPath"
+    }
+
+    if (-not (Test-SiblingTempDirectoryPath -Path $TempDirectoryPath -ParentPath $ParentPath -TempDirectoryName $TempDirectoryName)) {
+        throw "拒绝清理非脚本临时目录: $TempDirectoryPath"
+    }
+
+    Remove-FileSystemItem -Path $TempDirectoryPath -Recurse
+}
+
+# 仅当脚本专属临时目录为空时删除；非空返回 false，交由调用方决定提示方式。
+function Remove-EmptySiblingTempDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectoryName
+    )
+
+    if (-not (Test-FileSystemPath -Path $TempDirectoryPath)) {
+        return $true
+    }
+
+    if (Test-FileSystemFile -Path $TempDirectoryPath) {
+        throw "临时目录路径被同名文件占用: $TempDirectoryPath"
+    }
+
+    if (-not (Test-SiblingTempDirectoryPath -Path $TempDirectoryPath -ParentPath $ParentPath -TempDirectoryName $TempDirectoryName)) {
+        throw "拒绝清理非脚本临时目录: $TempDirectoryPath"
+    }
+
+    if (Get-DirectoryItemCount -DirectoryPath $TempDirectoryPath -TreatErrorAsNonEmpty) {
+        return $false
+    }
+
+    Remove-FileSystemItem -Path $TempDirectoryPath
+    return -not (Test-FileSystemPath -Path $TempDirectoryPath)
+}
+
 # 输出相对路径用于展示，避免终端日志被完整绝对路径撑得过长。
 function Get-RelativePathText {
     param(
@@ -501,7 +886,7 @@ function Get-RelativePathText {
     return "$PathPrefix\$relativePathText"
 }
 
-# 兼容交互输入时复制带首尾英文引号的路径；这里只移除成对包裹符号。
+# 处理交互输入时复制带首尾英文引号的路径；这里只移除成对包裹符号。
 function ConvertTo-UnquotedPathText {
     param(
         [Parameter(Mandatory = $true)]
@@ -522,6 +907,214 @@ function ConvertTo-UnquotedPathText {
     }
 
     return $normalizedPathText
+}
+
+# 判断输入文本是否为 Windows 绝对路径。
+function Test-WindowsAbsolutePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathText
+    )
+
+    try {
+        return [System.IO.Path]::IsPathFullyQualified($PathText)
+    }
+    catch {
+        return $false
+    }
+}
+
+# 判断文件系统对象是否为隐藏项。
+function Test-HiddenFileSystemItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    return (($Item.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0)
+}
+
+# 解析单个用户输入路径，并按需要限制文件或目录类型。
+function Resolve-InputPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathText,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Any', 'File', 'Directory')]
+        [string]$PathType = 'Any'
+    )
+
+    $cleanPath = ConvertTo-UnquotedPathText -PathText $PathText
+    if ([string]::IsNullOrWhiteSpace($cleanPath)) {
+        return [pscustomobject]@{
+            Success = $false
+            Item    = $null
+            Error   = '路径为空。'
+        }
+    }
+
+    if (-not (Test-WindowsAbsolutePath -PathText $cleanPath)) {
+        return [pscustomobject]@{
+            Success = $false
+            Item    = $null
+            Error   = '请输入 Windows 绝对路径。'
+        }
+    }
+
+    $resolvedItem = $null
+    try {
+        $resolvedItem = Get-FileSystemItem -Path $cleanPath
+    }
+    catch {
+        return [pscustomobject]@{
+            Success = $false
+            Item    = $null
+            Error   = $_.Exception.Message
+        }
+    }
+
+    if ($null -eq $resolvedItem) {
+        return [pscustomobject]@{
+            Success = $false
+            Item    = $null
+            Error   = '路径不存在。'
+        }
+    }
+
+    try {
+        if ($PathType -eq 'File' -and $resolvedItem -is [System.IO.DirectoryInfo]) {
+            return [pscustomobject]@{
+                Success = $false
+                Item    = $null
+                Error   = '请输入文件路径。'
+            }
+        }
+
+        if ($PathType -eq 'Directory' -and $resolvedItem -isnot [System.IO.DirectoryInfo]) {
+            return [pscustomobject]@{
+                Success = $false
+                Item    = $null
+                Error   = '请输入文件夹路径。'
+            }
+        }
+
+        return [pscustomobject]@{
+            Success = $true
+            Item    = $resolvedItem
+            Error   = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Success = $false
+            Item    = $null
+            Error   = $_.Exception.Message
+        }
+    }
+}
+
+# 批量解析用户输入路径，并按规范化后的完整路径静默去重。
+function Resolve-InputPathList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PathList,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Any', 'File', 'Directory')]
+        [string]$PathType = 'Any',
+
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.HashSet[string]]$ExistingKeySet
+    )
+
+    if ($null -eq $ExistingKeySet) {
+        $ExistingKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    $resolvedItemList = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
+    $pendingKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pathText in $PathList) {
+        $resolvedResult = Resolve-InputPath -PathText $pathText -PathType $PathType
+        if (-not $resolvedResult.Success) {
+            return [pscustomobject]@{
+                Success = $false
+                Items   = @()
+                Error   = "路径无效: $pathText。$($resolvedResult.Error)"
+            }
+        }
+
+        $itemKey = ConvertTo-NormalizedPath -Path $resolvedResult.Item.FullName
+        if (-not $ExistingKeySet.Contains($itemKey) -and $pendingKeySet.Add($itemKey)) {
+            $resolvedItemList.Add($resolvedResult.Item)
+        }
+    }
+
+    foreach ($itemKey in $pendingKeySet) {
+        [void]$ExistingKeySet.Add($itemKey)
+    }
+
+    return [pscustomobject]@{
+        Success = $true
+        Items   = $resolvedItemList.ToArray()
+        Error   = $null
+    }
+}
+
+# 批量解析目录输入、按真实路径去重，并拒绝父子目录。
+function Resolve-IndependentInputDirectoryList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PathList,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$ExistingDirectoryPathList = @()
+    )
+
+    $existingKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($existingDirectoryPath in $ExistingDirectoryPathList) {
+        [void]$existingKeySet.Add((ConvertTo-NormalizedPath -Path $existingDirectoryPath))
+    }
+
+    $resolvedResult = Resolve-InputPathList `
+        -PathList $PathList `
+        -PathType Directory `
+        -ExistingKeySet $existingKeySet
+    if (-not $resolvedResult.Success) {
+        return [pscustomobject]@{
+            Success = $false
+            Items   = @()
+            Paths   = @()
+            Error   = $resolvedResult.Error
+        }
+    }
+
+    $resolvedDirectoryPathList = [System.Collections.Generic.List[string]]::new()
+    foreach ($resolvedItem in @($resolvedResult.Items)) {
+        $resolvedDirectoryPathList.Add((Get-DirectoryKey -DirectoryPath $resolvedItem.FullName))
+    }
+
+    try {
+        Assert-NoParentChildDirectorySet `
+            -DirectoryPathList $resolvedDirectoryPathList.ToArray() `
+            -ExistingDirectoryPathList $ExistingDirectoryPathList
+    }
+    catch {
+        return [pscustomobject]@{
+            Success = $false
+            Items   = @()
+            Paths   = @()
+            Error   = $_.Exception.Message
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $true
+        Items   = $resolvedResult.Items
+        Paths   = $resolvedDirectoryPathList.ToArray()
+        Error   = $null
+    }
 }
 
 # 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段是绝对路径时按空格分隔。
@@ -604,8 +1197,8 @@ function Split-InteractivePathInput {
     return $expandedPathList.ToArray()
 }
 
-# 将目录路径标准化为便于比较的形式，用于目录重叠检查。
-function ConvertTo-NormalizedDirectoryPath {
+# 将文件或目录路径标准化为便于比较的形式；文件路径调用时去除尾部分隔符是空操作。
+function ConvertTo-NormalizedPath {
     param(
         [Parameter(Mandatory = $true)]
         [Alias('DirectoryPath')]
@@ -623,7 +1216,7 @@ function Get-DirectoryKey {
         [string]$DirectoryPath
     )
 
-    return ConvertTo-NormalizedDirectoryPath -Path $DirectoryPath
+    return ConvertTo-NormalizedPath -Path $DirectoryPath
 }
 
 # 给目录路径追加结尾分隔符，避免 C:\A 和 C:\AB 这种前缀误判；根目录已带分隔符时不再重复追加。
@@ -650,13 +1243,18 @@ function Get-DirectoryPathDepth {
     )
 
     # 过滤空段后，C:\A、\\server\share\A 等不同前缀形式的层级比较更稳定。
-    return @((Get-DirectoryKey -DirectoryPath $DirectoryPath) -split '[\\/]' | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        }).Count
+    $depth = 0
+    foreach ($pathSegment in (Get-DirectoryKey -DirectoryPath $DirectoryPath).Split([char[]]@('\', '/'))) {
+        if (-not [string]::IsNullOrWhiteSpace($pathSegment)) {
+            $depth++
+        }
+    }
+
+    return $depth
 }
 
-# 判断两个目录是否相同或互相包含。
-function Test-DirectoryOverlap {
+# 判断两个目录是否存在父子关系；相同目录不算父子关系，重复路径由路径解析去重处理。
+function Test-ParentChildDirectoryPair {
     param(
         [Parameter(Mandatory = $true)]
         [string]$LeftPath,
@@ -669,42 +1267,123 @@ function Test-DirectoryOverlap {
     $rightKey = Get-DirectoryKey -DirectoryPath $RightPath
 
     if ($leftKey.Equals($rightKey, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $true
+        return $false
     }
 
     $leftPrefix = Add-TrailingDirectorySeparator -DirectoryPath $leftKey
     $rightPrefix = Add-TrailingDirectorySeparator -DirectoryPath $rightKey
 
-    # 先追加尾部分隔符再做 StartsWith，避免 C:\A 被误判为 C:\AB 的父目录。
-    return ($leftPrefix.StartsWith($rightPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $rightPrefix.StartsWith($leftPrefix, [System.StringComparison]::OrdinalIgnoreCase))
+    # 非父子目录直接视为独立目录；追加尾部分隔符可避免 C:\A 误判为 C:\AB 的父目录。
+    return ($rightKey.StartsWith($leftPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $leftKey.StartsWith($rightPrefix, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+# 从目录集合中找出第一组父子目录；可传入已有目录集合用于交互式增量校验。
+function Find-ParentChildDirectoryPair {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$DirectoryPathList,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$ExistingDirectoryPathList = @()
+    )
+
+    for ($existingIndex = 0; $existingIndex -lt $ExistingDirectoryPathList.Count; $existingIndex++) {
+        for ($directoryIndex = 0; $directoryIndex -lt $DirectoryPathList.Count; $directoryIndex++) {
+            if (Test-ParentChildDirectoryPair -LeftPath $ExistingDirectoryPathList[$existingIndex] -RightPath $DirectoryPathList[$directoryIndex]) {
+                return [pscustomobject]@{
+                    Found       = $true
+                    LeftPath    = $ExistingDirectoryPathList[$existingIndex]
+                    RightPath   = $DirectoryPathList[$directoryIndex]
+                    LeftIndex   = $existingIndex
+                    RightIndex  = $directoryIndex
+                    LeftSource  = 'Existing'
+                    RightSource = 'Input'
+                }
+            }
+        }
+    }
+
+    for ($leftIndex = 0; $leftIndex -lt $DirectoryPathList.Count; $leftIndex++) {
+        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $DirectoryPathList.Count; $rightIndex++) {
+            if (Test-ParentChildDirectoryPair -LeftPath $DirectoryPathList[$leftIndex] -RightPath $DirectoryPathList[$rightIndex]) {
+                return [pscustomobject]@{
+                    Found       = $true
+                    LeftPath    = $DirectoryPathList[$leftIndex]
+                    RightPath   = $DirectoryPathList[$rightIndex]
+                    LeftIndex   = $leftIndex
+                    RightIndex  = $rightIndex
+                    LeftSource  = 'Input'
+                    RightSource = 'Input'
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Found       = $false
+        LeftPath    = $null
+        RightPath   = $null
+        LeftIndex   = -1
+        RightIndex  = -1
+        LeftSource  = $null
+        RightSource = $null
+    }
+}
+
+# 拒绝目录集合中的父子目录关系；相同目录应由路径解析阶段去重，不在这里视为错误。
+function Assert-NoParentChildDirectorySet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$DirectoryPathList,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$ExistingDirectoryPathList = @()
+    )
+
+    $parentChildPair = Find-ParentChildDirectoryPair `
+        -DirectoryPathList $DirectoryPathList `
+        -ExistingDirectoryPathList $ExistingDirectoryPathList
+    if ($parentChildPair.Found) {
+        throw '目录不能互为父子目录。'
+    }
 }
 
 Export-ModuleMember -Function @(
     'Write-StageMessage'
-    'Write-MenuItem'
     'Read-ColoredLine'
     'Read-MenuChoice'
-    'Get-ConsoleCharacterCellWidth'
-    'Get-ConsoleTextWithinCellWidth'
-    'Get-ConsoleTextWidth'
-    'Write-DynamicStatusLine'
     'Complete-DynamicStatusLine'
     'Write-ProgressBar'
     'Write-RefreshStatusLine'
     'Write-PreviewSeparator'
     'Write-StatusSummary'
-    'Test-EnterKeyPressed'
-    'Wait-AssumeYesDeletionGracePeriod'
+    'Wait-DangerousOperationGracePeriod'
     'New-DeferredScanWarningList'
     'Add-DeferredScanWarning'
     'Write-DeferredScanWarningList'
+    'Test-FileSystemFile'
+    'Test-FileSystemDirectory'
+    'Test-FileSystemPath'
+    'Remove-FileSystemItem'
+    'Test-SiblingTempDirectoryName'
+    'Initialize-SiblingTempDirectory'
+    'Clear-SiblingTempDirectoryContents'
+    'Remove-SiblingTempDirectory'
+    'Remove-EmptySiblingTempDirectory'
     'Get-RelativePathText'
     'ConvertTo-UnquotedPathText'
+    'Test-HiddenFileSystemItem'
+    'Resolve-InputPath'
+    'Resolve-InputPathList'
+    'Resolve-IndependentInputDirectoryList'
     'Split-InteractivePathInput'
-    'ConvertTo-NormalizedDirectoryPath'
+    'ConvertTo-NormalizedPath'
     'Get-DirectoryKey'
     'Add-TrailingDirectorySeparator'
     'Get-DirectoryPathDepth'
-    'Test-DirectoryOverlap'
 )

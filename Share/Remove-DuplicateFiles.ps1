@@ -42,7 +42,10 @@ param(
 # ========== 可调整配置 ==========
 
 # 部分哈希预筛选时读取文件头尾每段的字节数；值越大越稳，扫描成本也越高。
-$PartialHashSegmentByteCount = 256KB
+$PartialHashSegmentByteCount = 64KB
+
+# 哈希计算并发数；设为 1 可退回串行，机械硬盘或网络盘可适当调低。
+$HashParallelThrottleLimit = 8
 
 # 删除预览中分隔不同重复文件组的横线长度。
 $PreviewSeparatorCellCount = 64
@@ -59,17 +62,14 @@ $ProgressBarFilledCharacter = '#'
 # 文本进度条未完成部分的字符。
 $ProgressBarEmptyCharacter = '-'
 
+# 进度条同百分比状态下的强制刷新间隔；设为 0 或负数则只在百分比变化时刷新。
+$ProgressBarTimedRefreshMilliseconds = 1000
+
 # 使用 -yes 时的默认删除倒计时秒数，给用户留出取消窗口。
 $AssumeYesGraceSeconds = 10
 
 # -yes 倒计时期间检查 Enter 输入的间隔。
 $AssumeYesInputPollIntervalMilliseconds = 100
-
-# 上一次动态状态行的显示宽度；用于本次刷新时清掉旧尾巴。
-$script:DynamicStatusLastCellWidth = 0
-
-# 记录上一条动态状态是否真的以内联方式输出；输出重定向或降级时不额外补换行。
-$script:DynamicStatusLastWriteWasInline = $false
 
 # ========== 运行环境设置 ==========
 
@@ -91,6 +91,16 @@ $ShouldAssumeYesDeletion = [bool]$AssumeYes
 # 记录 -yes 倒计时是否被 Enter 取消；多目录分别执行时用于停止后续目录。
 $AssumeYesDeletionCancelled = $false
 
+# 输出相关运行状态；由动态状态行和进度条函数维护，请勿手动修改。
+$script:OutputRuntimeState = [pscustomobject]@{
+    # 上一次动态状态行的显示宽度；用于本次刷新时清掉旧尾巴。
+    DynamicStatusLastCellWidth            = 0
+    # 记录上一条动态状态是否真的以内联方式输出；输出重定向或降级时不额外补换行。
+    DynamicStatusLastWriteWasInline       = $false
+    # 记录各进度条最近一次刷新时间；用于同百分比但耗时较长时按间隔刷新计数。
+    ProgressBarLastRefreshMillisecondsByKey  = @{}
+}
+
 # ========== 输出与路径工具 ==========
 
 function Show-HelpText {
@@ -103,7 +113,7 @@ function Show-HelpText {
   powershell -File .\Remove-DuplicateFiles.ps1 -c [-s] [-yes] [ReferencePath] [TargetPath1] [TargetPath2 ...]
 
 参数：
-  Path   文件夹绝对路径；路径含空格请使用英文引号。
+  Path   文件夹绝对路径；路径含空格时，请使用英文引号包裹路径。
   -a     多目录合并模式，把多个目录视作一个大目录。
   -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
@@ -120,7 +130,8 @@ function Show-HelpText {
   单目录和多目录合并模式可默认删除、手动删除、跳过本次操作或退出。
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除、跳过本次操作或退出。
-  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格请使用英文引号。
+  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。
+  重复文件候选哈希计算默认使用 8 个并发 worker；每个 worker 批量处理文件，可修改脚本顶部 $HashParallelThrottleLimit 调整，设为 1 可退回串行。
 '@
 }
 
@@ -238,7 +249,7 @@ function Get-ConsoleTextWithinCellWidth {
     }
 }
 
-# 刷新单行动态状态；不使用 SetCursorPosition，避免光标定位失败后停在补空格末尾。
+# 刷新单行动态状态；写完整行后回到行首，减少行尾光标闪烁。
 function Write-DynamicStatusLine {
     param(
         [Parameter(Mandatory = $true)]
@@ -255,45 +266,44 @@ function Write-DynamicStatusLine {
         if ([Console]::IsOutputRedirected) {
             Complete-DynamicStatusLine
             Write-Host $statusMessage -ForegroundColor $Color
-            $script:DynamicStatusLastCellWidth = 0
-            $script:DynamicStatusLastWriteWasInline = $false
+            $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+            $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
             return
         }
 
         $maxLineWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
         $lineText = Get-ConsoleTextWithinCellWidth -Text $statusMessage -MaxCellWidth $maxLineWidth
 
-        # 先写“当前文本 + 必要补空格”清除上一条长文本尾巴，再回到行首写当前文本。
-        # 这样光标自然停在当前文本末尾，不依赖宿主是否支持 SetCursorPosition。
-        $clearWidth = [Math]::Min($maxLineWidth, [Math]::Max($script:DynamicStatusLastCellWidth, $lineText.CellWidth))
+        # 写“当前文本 + 必要补空格”清除上一条长文本尾巴，结尾回到行首等待下次覆盖。
+        $clearWidth = [Math]::Min($maxLineWidth, [Math]::Max($script:OutputRuntimeState.DynamicStatusLastCellWidth, $lineText.CellWidth))
         $paddingWidth = [Math]::Max(0, $clearWidth - $lineText.CellWidth)
         $paddingText = ' ' * $paddingWidth
-        Write-Host -NoNewline "`r$($lineText.Text)$paddingText`r$($lineText.Text)" -ForegroundColor $Color
+        Write-Host -NoNewline "`r$($lineText.Text)$paddingText`r" -ForegroundColor $Color
 
-        $script:DynamicStatusLastCellWidth = $lineText.CellWidth
-        $script:DynamicStatusLastWriteWasInline = $true
+        $script:OutputRuntimeState.DynamicStatusLastCellWidth = $lineText.CellWidth
+        $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $true
         return
     }
     catch {
         # 某些宿主不支持读取控制台宽度；静默降级为普通整行输出，避免异常打断进度行。
         Complete-DynamicStatusLine
         Write-Host $statusMessage -ForegroundColor $Color
-        $script:DynamicStatusLastCellWidth = 0
-        $script:DynamicStatusLastWriteWasInline = $false
+        $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+        $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
     }
 }
 
 # 结束当前动态状态行；只有确实使用了内联刷新时才补换行。
 function Complete-DynamicStatusLine {
-    if ($script:DynamicStatusLastWriteWasInline) {
+    if ($script:OutputRuntimeState.DynamicStatusLastWriteWasInline) {
         Write-Host ""
     }
 
-    $script:DynamicStatusLastCellWidth = 0
-    $script:DynamicStatusLastWriteWasInline = $false
+    $script:OutputRuntimeState.DynamicStatusLastCellWidth = 0
+    $script:OutputRuntimeState.DynamicStatusLastWriteWasInline = $false
 }
 
-# 更新百分比进度条；使用普通文本单行刷新，避免 Write-Progress 改变控制台背景色。
+# 更新百分比进度条；百分比变化或同百分比超过配置间隔时刷新，避免长任务看起来卡住。
 function Write-ProgressBar {
     param(
         [Parameter(Mandatory = $true)]
@@ -320,7 +330,18 @@ function Write-ProgressBar {
     }
 
     $percent = [Math]::Min(100, [int][Math]::Floor(($ProcessedCount / $TotalCount) * 100))
-    if (-not $Force -and $percent -eq $LastPercent.Value) {
+    $refreshKey = "$Activity`0$Status"
+    $currentMilliseconds = [long]([DateTime]::UtcNow.Ticks / [TimeSpan]::TicksPerMillisecond)
+    $refreshIntervalMilliseconds = [Math]::Max(0, [int]$ProgressBarTimedRefreshMilliseconds)
+    $shouldRefreshByPercent = ($percent -ne $LastPercent.Value)
+    $shouldRefreshByTime = $false
+
+    if ($refreshIntervalMilliseconds -gt 0 -and $script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey.ContainsKey($refreshKey)) {
+        $lastRefreshMilliseconds = [long]$script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey[$refreshKey]
+        $shouldRefreshByTime = (($currentMilliseconds - $lastRefreshMilliseconds) -ge $refreshIntervalMilliseconds)
+    }
+
+    if (-not $Force -and -not $shouldRefreshByPercent -and -not $shouldRefreshByTime) {
         return
     }
 
@@ -331,6 +352,7 @@ function Write-ProgressBar {
 
     Write-DynamicStatusLine -Message $progressText -Color Cyan
     $LastPercent.Value = $percent
+    $script:OutputRuntimeState.ProgressBarLastRefreshMillisecondsByKey[$refreshKey] = $currentMilliseconds
 }
 
 # 新建延迟输出的扫描警告列表，避免进度条刷新时被错误信息打断。
@@ -494,6 +516,30 @@ function ConvertTo-UnquotedPathText {
     return $normalizedPathText
 }
 
+# 判断输入文本是否为 Windows 绝对路径；Windows PowerShell 5.1 缺少 IsPathFullyQualified 时使用兼容判断。
+function Test-WindowsAbsolutePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathText
+    )
+
+    try {
+        $method = [System.IO.Path].GetMethod('IsPathFullyQualified', [type[]]@([string]))
+        if ($null -ne $method) {
+            return [bool]$method.Invoke($null, @($PathText))
+        }
+    }
+    catch {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PathText)) {
+        return $false
+    }
+
+    return ($PathText -match '^[a-zA-Z]:[\\/]' -or $PathText -match '^[\\/]{2}[^\\/]+[\\/]+[^\\/]')
+}
+
 # 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段看起来是绝对路径时按空格分隔。
 function Split-InteractivePathInput {
     param(
@@ -584,37 +630,29 @@ function Resolve-InputDirectory {
 
     $normalizedPathText = ConvertTo-UnquotedPathText -PathText $Path
 
-    $isAbsolutePath = $normalizedPathText -match '^[a-zA-Z]:[\\/]' -or $normalizedPathText -match '^[\\/]{2}'
-    if (-not $isAbsolutePath) {
+    if (-not (Test-WindowsAbsolutePath -PathText $normalizedPathText)) {
         throw "$ParameterName 必须是 Windows 文件夹绝对路径: $normalizedPathText"
     }
 
     try {
-        $resolvedPaths = @(Resolve-Path -LiteralPath $normalizedPathText -ErrorAction Stop)
-    }
-    catch {
-        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格请使用英文引号。原始错误: $($_.Exception.Message)"
-    }
-
-    if ($resolvedPaths.Count -ne 1) {
-        throw "$ParameterName 必须只能解析到一个目录。"
-    }
-
-    try {
-        $item = Get-Item -LiteralPath $resolvedPaths[0].ProviderPath -ErrorAction Stop
+        $fullPath = [System.IO.Path]::GetFullPath($normalizedPathText)
     }
     catch {
         throw "$ParameterName 无法读取: $normalizedPathText。原因: $($_.Exception.Message)"
     }
 
-    if (-not $item.PSIsContainer) {
+    if ([System.IO.File]::Exists($fullPath)) {
         throw "$ParameterName 必须是文件夹: $normalizedPathText"
     }
 
-    return $item.FullName
+    if (-not [System.IO.Directory]::Exists($fullPath)) {
+        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格时，请使用英文引号包裹路径。"
+    }
+
+    return ([System.IO.DirectoryInfo]::new($fullPath)).FullName
 }
 
-# 逐个校验路径列表，并返回规范化后的完整目录路径。
+# 逐个校验路径列表，自动去重后返回规范化后的完整目录路径。
 function Resolve-InputDirectoryList {
     param(
         [Parameter(Mandatory = $true)]
@@ -624,13 +662,37 @@ function Resolve-InputDirectoryList {
         [string]$ParameterNamePrefix = 'Path',
 
         [Parameter(Mandatory = $false)]
-        [int]$StartIndex = 1
+        [int]$StartIndex = 1,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExistingPathList = @()
     )
 
-    return @(
-        for ($index = 0; $index -lt $PathList.Count; $index++) {
-            Resolve-InputDirectory -Path $PathList[$index] -ParameterName "$($ParameterNamePrefix)[$($StartIndex + $index)]"
+    $resolvedDirectoryList = New-Object System.Collections.Generic.List[string]
+    $resolvedDirectoryKeySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($existingPath in $ExistingPathList) {
+        [void]$resolvedDirectoryKeySet.Add((ConvertTo-NormalizedPath -Path $existingPath))
+    }
+
+    for ($index = 0; $index -lt $PathList.Count; $index++) {
+        $resolvedDirectory = Resolve-InputDirectory -Path $PathList[$index] -ParameterName "$($ParameterNamePrefix)[$($StartIndex + $index)]"
+        $directoryKey = ConvertTo-NormalizedPath -Path $resolvedDirectory
+        if ($resolvedDirectoryKeySet.Add($directoryKey)) {
+            $resolvedDirectoryList.Add($resolvedDirectory)
         }
+    }
+
+    try {
+        Assert-NoParentChildDirectorySet `
+            -DirectoryPathList $resolvedDirectoryList.ToArray() `
+            -ExistingDirectoryPathList $ExistingPathList
+    }
+    catch {
+        throw '输入目录不能互为父子目录。'
+    }
+
+    return @(
+        $resolvedDirectoryList.ToArray()
     )
 }
 
@@ -641,7 +703,10 @@ function Resolve-InteractivePathInputLine {
         [string]$PathInput,
 
         [Parameter(Mandatory = $true)]
-        [int]$StartIndex
+        [int]$StartIndex,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExistingPathList = @()
     )
 
     $pathInputList = @(Split-InteractivePathInput -PathInput $PathInput)
@@ -649,7 +714,11 @@ function Resolve-InteractivePathInputLine {
         throw '未识别到可用路径。'
     }
 
-    $resolvedPathInputList = @(Resolve-InputDirectoryList -PathList $pathInputList -ParameterNamePrefix 'Path' -StartIndex $StartIndex)
+    $resolvedPathInputList = @(Resolve-InputDirectoryList `
+            -PathList $pathInputList `
+            -ParameterNamePrefix 'Path' `
+            -StartIndex $StartIndex `
+            -ExistingPathList $ExistingPathList)
 
     return [pscustomobject]@{
         InputCount = $pathInputList.Count
@@ -670,7 +739,7 @@ function Read-InteractivePathList {
     $inputPathList = New-Object System.Collections.Generic.List[string]
     Write-Host "进入$ModePrompt。" -ForegroundColor Cyan
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格请使用英文引号。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {
@@ -715,21 +784,19 @@ function Read-InteractivePathList {
         }
 
         try {
-            $lineInputResult = Resolve-InteractivePathInputLine -PathInput $pathInput -StartIndex ($inputPathList.Count + 1)
+            $lineInputResult = Resolve-InteractivePathInputLine `
+                -PathInput $pathInput `
+                -StartIndex ($inputPathList.Count + 1) `
+                -ExistingPathList $inputPathList.ToArray()
         }
         catch {
-            Write-Host "输入无效，请重新输入存在的 Windows 文件夹绝对路径；路径含空格请使用英文引号。" -ForegroundColor Yellow
+            Write-Host $_.Exception.Message -ForegroundColor Yellow
             continue
         }
 
         $resolvedPathInputList = @($lineInputResult.PathList)
-        $candidatePathList = @($inputPathList.ToArray()) + $resolvedPathInputList
-
-        try {
-            Assert-IndependentDirectorySet -RootPathList $candidatePathList
-        }
-        catch {
-            Write-Host "路径无效，请不要输入相同目录、父子目录或互相包含的目录。本次输入不保留。" -ForegroundColor Yellow
+        if ($resolvedPathInputList.Count -eq 0) {
+            Write-Host "输入路径已存在，本次未新增。" -ForegroundColor DarkGray
             continue
         }
 
@@ -738,13 +805,13 @@ function Read-InteractivePathList {
         }
 
         if ($lineInputResult.InputCount -gt 1) {
-            Write-Host "识别到 $($lineInputResult.InputCount) 个路径。" -ForegroundColor DarkGray
+            Write-Host "识别到 $($resolvedPathInputList.Count) 个新路径。" -ForegroundColor DarkGray
         }
     }
 }
 
-# 将目录路径标准化为便于比较的形式，用于目录重叠检查。
-function ConvertTo-NormalizedDirectoryPath {
+# 将路径标准化为便于比较的形式；文件路径同样适用，去除尾部分隔符对文件路径是空操作。
+function ConvertTo-NormalizedPath {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path
@@ -786,60 +853,70 @@ function Get-RelativePathCompat {
     return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
 }
 
-# 同一次扫描中的目录必须互不包含，避免同一文件被重复扫描或重复处理。
-function Assert-IndependentDirectoryPair {
+# 判断两个目录是否存在父子关系；相同目录不算父子关系，重复路径由路径解析去重处理。
+function Test-ParentChildDirectoryPair {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$LeftRootPath,
+        [string]$LeftPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$RightRootPath,
-
-        [Parameter(Mandatory = $false)]
-        [string]$LeftName = 'Path1',
-
-        [Parameter(Mandatory = $false)]
-        [string]$RightName = 'Path2'
+        [string]$RightPath
     )
 
-    $normalizedLeftPath = ConvertTo-NormalizedDirectoryPath -Path $LeftRootPath
-    $normalizedRightPath = ConvertTo-NormalizedDirectoryPath -Path $RightRootPath
+    $normalizedLeftPath = ConvertTo-NormalizedPath -Path $LeftPath
+    $normalizedRightPath = ConvertTo-NormalizedPath -Path $RightPath
 
     if ($normalizedLeftPath.Equals($normalizedRightPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$LeftName 和 $RightName 不能是同一个目录。"
+        return $false
     }
 
     $leftPathPrefix = Add-TrailingDirectorySeparator -Path $normalizedLeftPath
     $rightPathPrefix = Add-TrailingDirectorySeparator -Path $normalizedRightPath
 
-    if ($normalizedRightPath.StartsWith($leftPathPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$RightName 不能位于 $LeftName 子目录中。"
-    }
-
-    if ($normalizedLeftPath.StartsWith($rightPathPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$LeftName 不能位于 $RightName 子目录中。"
-    }
+    return ($normalizedRightPath.StartsWith($leftPathPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalizedLeftPath.StartsWith($rightPathPrefix, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
-# 校验一组目录两两独立，避免同一文件在一次运行中被重复扫描或重复处理。
-function Assert-IndependentDirectorySet {
+# 拒绝目录集合中的父子目录关系；相同目录应由路径解析阶段去重，不在这里视为错误。
+function Assert-NoParentChildDirectorySet {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$RootPathList
+        [AllowEmptyCollection()]
+        [string[]]$DirectoryPathList,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$ExistingDirectoryPathList = @()
     )
 
-    for ($leftIndex = 0; $leftIndex -lt $RootPathList.Count; $leftIndex++) {
-        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $RootPathList.Count; $rightIndex++) {
-            Assert-IndependentDirectoryPair `
-                -LeftRootPath $RootPathList[$leftIndex] `
-                -RightRootPath $RootPathList[$rightIndex] `
-                -LeftName "Path$($leftIndex + 1)" `
-                -RightName "Path$($rightIndex + 1)"
+    for ($existingIndex = 0; $existingIndex -lt $ExistingDirectoryPathList.Count; $existingIndex++) {
+        for ($directoryIndex = 0; $directoryIndex -lt $DirectoryPathList.Count; $directoryIndex++) {
+            if (Test-ParentChildDirectoryPair -LeftPath $ExistingDirectoryPathList[$existingIndex] -RightPath $DirectoryPathList[$directoryIndex]) {
+                throw '目录不能互为父子目录。'
+            }
+        }
+    }
+
+    for ($leftIndex = 0; $leftIndex -lt $DirectoryPathList.Count; $leftIndex++) {
+        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $DirectoryPathList.Count; $rightIndex++) {
+            if (Test-ParentChildDirectoryPair -LeftPath $DirectoryPathList[$leftIndex] -RightPath $DirectoryPathList[$rightIndex]) {
+                throw '目录不能互为父子目录。'
+            }
         }
     }
 }
 
 # ========== 哈希与重复文件识别 ==========
+
+# 判断部分哈希是否已经覆盖完整文件；覆盖时可直接把部分哈希当作最终哈希。
+function Test-PartialHashCoversFullFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$Length
+    )
+
+    return $Length -le ([int64]$PartialHashSegmentByteCount * 2)
+}
 
 # 计算文件首尾片段的 SHA-256，用作快速筛选候选重复文件。
 function Get-PartialContentHash {
@@ -852,7 +929,13 @@ function Get-PartialContentHash {
     $fileStream = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
 
     try {
-        # 这里只做快速预筛选；真正删除前仍会使用完整 SHA-256 确认。
+        # 文件不超过两段采样总长时直接计算完整文件，避免头尾片段重叠读取。
+        if (Test-PartialHashCoversFullFile -Length $File.Length) {
+            $hashBytes = $sha256.ComputeHash($fileStream)
+            return [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+        }
+
+        # 大文件只做快速预筛选；真正删除前仍会使用完整 SHA-256 确认。
         $hashBuffer = [byte[]]::new($PartialHashSegmentByteCount)
 
         $firstRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
@@ -896,6 +979,341 @@ function Get-FullContentHash {
         $fileStream.Dispose()
         $sha256.Dispose()
     }
+}
+
+# 在独立 runspace 中批量计算文件哈希；脚本块不依赖外部函数，便于受控并行执行。
+$script:ContentHashWorkerScript = {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$FilePathList,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Partial', 'Full')]
+        [string]$HashKind,
+
+        [Parameter(Mandatory = $true)]
+        [int]$PartialHashSegmentByteCount
+    )
+
+    foreach ($filePath in $FilePathList) {
+        $sha256 = $null
+        $fileStream = $null
+        try {
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            $fileStream = [System.IO.File]::Open($filePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+            if ($HashKind -eq 'Partial') {
+                if ($fileStream.Length -le ([int64]$PartialHashSegmentByteCount * 2)) {
+                    $hashBytes = $sha256.ComputeHash($fileStream)
+                }
+                else {
+                    $hashBuffer = [byte[]]::new($PartialHashSegmentByteCount)
+                    $firstRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
+                    if ($firstRead -gt 0) {
+                        [void]$sha256.TransformBlock($hashBuffer, 0, $firstRead, $null, 0)
+                    }
+
+                    $tailOffset = [Math]::Max(0, $fileStream.Length - $PartialHashSegmentByteCount)
+                    [void]$fileStream.Seek($tailOffset, [System.IO.SeekOrigin]::Begin)
+                    $lastRead = $fileStream.Read($hashBuffer, 0, $hashBuffer.Length)
+                    if ($lastRead -gt 0) {
+                        [void]$sha256.TransformBlock($hashBuffer, 0, $lastRead, $null, 0)
+                    }
+
+                    [void]$sha256.TransformFinalBlock([byte[]]::new(0), 0, 0)
+                    $hashBytes = $sha256.Hash
+                }
+            }
+            else {
+                $hashBytes = $sha256.ComputeHash($fileStream)
+            }
+
+            [pscustomobject]@{
+                Success = $true
+                Path    = $filePath
+                Hash    = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+                Message = $null
+            }
+        }
+        catch {
+            [pscustomobject]@{
+                Success = $false
+                Path    = $filePath
+                Hash    = $null
+                Message = $_.Exception.Message
+            }
+        }
+        finally {
+            if ($null -ne $fileStream) {
+                $fileStream.Dispose()
+            }
+
+            if ($null -ne $sha256) {
+                $sha256.Dispose()
+            }
+        }
+    }
+}
+
+# 启动一个受控并行哈希批次任务。
+function Start-ContentHashRunspaceBatchJob {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Runspaces.RunspacePool]$RunspacePool,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$FilePathList,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Partial', 'Full')]
+        [string]$HashKind
+    )
+
+    $powerShell = [System.Management.Automation.PowerShell]::Create()
+    $powerShell.RunspacePool = $RunspacePool
+    [void]$powerShell.AddScript($script:ContentHashWorkerScript.ToString())
+    [void]$powerShell.AddArgument([string[]]$FilePathList)
+    [void]$powerShell.AddArgument($HashKind)
+    [void]$powerShell.AddArgument([int]$PartialHashSegmentByteCount)
+
+    return [pscustomobject]@{
+        PowerShell = $powerShell
+        Handle     = $powerShell.BeginInvoke()
+        PathList   = $FilePathList
+    }
+}
+
+# 将哈希结果加入结果列表或警告列表，并刷新主线程进度。
+function Add-ContentHashResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$HashResult,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$HashRecordList,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$WarningList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WarningMessage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Activity,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TotalCount,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$ProcessedCount,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$LastPercent
+    )
+
+    $ProcessedCount.Value++
+    Write-ProgressBar -Activity $Activity -Status $Status -ProcessedCount $ProcessedCount.Value -TotalCount $TotalCount -LastPercent $LastPercent
+
+    if ($HashResult.Success) {
+        $HashRecordList.Add([pscustomobject]@{
+            File = [System.IO.FileInfo]::new($HashResult.Path)
+            Hash = $HashResult.Hash
+        })
+        return
+    }
+
+    Add-DeferredScanWarning -WarningList $WarningList -Message $WarningMessage -Path $HashResult.Path -Reason $HashResult.Message
+}
+
+# 按配置的并发数计算文件哈希；并发只用于读取和哈希，进度和警告仍由主线程统一处理。
+function Get-ContentHashRecordList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.IO.FileInfo[]]$FileList,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Partial', 'Full')]
+        [string]$HashKind,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Activity,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TotalCount,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$ProcessedCount,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$LastPercent,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$WarningList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WarningMessage
+    )
+
+    $hashRecordList = New-Object System.Collections.Generic.List[object]
+    if ($FileList.Count -eq 0) {
+        return $hashRecordList.ToArray()
+    }
+
+    $effectiveThrottleLimit = [Math]::Max(1, [int]$HashParallelThrottleLimit)
+    if ($effectiveThrottleLimit -le 1 -or $FileList.Count -eq 1) {
+        foreach ($file in $FileList) {
+            try {
+                if ($HashKind -eq 'Partial') {
+                    $hashValue = Get-PartialContentHash -File $file
+                }
+                else {
+                    $hashValue = Get-FullContentHash -File $file
+                }
+
+                Add-ContentHashResult `
+                    -HashResult ([pscustomobject]@{ Success = $true; Path = $file.FullName; Hash = $hashValue; Message = $null }) `
+                    -HashRecordList $hashRecordList `
+                    -WarningList $WarningList `
+                    -WarningMessage $WarningMessage `
+                    -Activity $Activity `
+                    -Status $Status `
+                    -TotalCount $TotalCount `
+                    -ProcessedCount $ProcessedCount `
+                    -LastPercent $LastPercent
+            }
+            catch {
+                Add-ContentHashResult `
+                    -HashResult ([pscustomobject]@{ Success = $false; Path = $file.FullName; Hash = $null; Message = $_.Exception.Message }) `
+                    -HashRecordList $hashRecordList `
+                    -WarningList $WarningList `
+                    -WarningMessage $WarningMessage `
+                    -Activity $Activity `
+                    -Status $Status `
+                    -TotalCount $TotalCount `
+                    -ProcessedCount $ProcessedCount `
+                    -LastPercent $LastPercent
+            }
+        }
+
+        return $hashRecordList.ToArray()
+    }
+
+    $batchCount = [Math]::Min($effectiveThrottleLimit, $FileList.Count)
+    $batchSize = [Math]::Max(1, [int][Math]::Ceiling($FileList.Count / [double]$batchCount))
+    $filePathBatchList = New-Object 'System.Collections.Generic.List[string[]]'
+    for ($batchStartIndex = 0; $batchStartIndex -lt $FileList.Count; $batchStartIndex += $batchSize) {
+        $batchPathList = New-Object System.Collections.Generic.List[string]
+        $batchEndIndex = [Math]::Min($FileList.Count - 1, $batchStartIndex + $batchSize - 1)
+        for ($fileIndex = $batchStartIndex; $fileIndex -le $batchEndIndex; $fileIndex++) {
+            $batchPathList.Add($FileList[$fileIndex].FullName)
+        }
+
+        $filePathBatchList.Add($batchPathList.ToArray())
+    }
+
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $effectiveThrottleLimit)
+    $pendingJobList = New-Object System.Collections.Generic.List[object]
+    $nextBatchIndex = 0
+
+    try {
+        $runspacePool.Open()
+
+        while ($nextBatchIndex -lt $filePathBatchList.Count -or $pendingJobList.Count -gt 0) {
+            while ($nextBatchIndex -lt $filePathBatchList.Count -and $pendingJobList.Count -lt $effectiveThrottleLimit) {
+                $pendingJobList.Add((Start-ContentHashRunspaceBatchJob -RunspacePool $runspacePool -FilePathList $filePathBatchList[$nextBatchIndex] -HashKind $HashKind))
+                $nextBatchIndex++
+            }
+
+            $completedAnyJob = $false
+            for ($jobIndex = $pendingJobList.Count - 1; $jobIndex -ge 0; $jobIndex--) {
+                $pendingJob = $pendingJobList[$jobIndex]
+                if (-not $pendingJob.Handle.IsCompleted) {
+                    continue
+                }
+
+                $completedAnyJob = $true
+                try {
+                    $jobOutputList = @($pendingJob.PowerShell.EndInvoke($pendingJob.Handle))
+                    if ($jobOutputList.Count -gt 0) {
+                        $hashResultList = $jobOutputList
+                    }
+                    else {
+                        $hashResultList = @(
+                            foreach ($filePath in $pendingJob.PathList) {
+                                [pscustomobject]@{
+                                    Success = $false
+                                    Path    = $filePath
+                                    Hash    = $null
+                                    Message = '哈希任务未返回结果。'
+                                }
+                            }
+                        )
+                    }
+                }
+                catch {
+                    $hashResultList = @(
+                        foreach ($filePath in $pendingJob.PathList) {
+                            [pscustomobject]@{
+                                Success = $false
+                                Path    = $filePath
+                                Hash    = $null
+                                Message = $_.Exception.Message
+                            }
+                        }
+                    )
+                }
+                finally {
+                    $pendingJob.PowerShell.Dispose()
+                    $pendingJobList.RemoveAt($jobIndex)
+                }
+
+                foreach ($hashResult in $hashResultList) {
+                    Add-ContentHashResult `
+                        -HashResult $hashResult `
+                        -HashRecordList $hashRecordList `
+                        -WarningList $WarningList `
+                        -WarningMessage $WarningMessage `
+                        -Activity $Activity `
+                        -Status $Status `
+                        -TotalCount $TotalCount `
+                        -ProcessedCount $ProcessedCount `
+                        -LastPercent $LastPercent
+                }
+            }
+
+            if (-not $completedAnyJob -and $pendingJobList.Count -gt 0) {
+                Start-Sleep -Milliseconds 50
+            }
+        }
+    }
+    finally {
+        foreach ($pendingJob in $pendingJobList) {
+            try {
+                $pendingJob.PowerShell.Stop()
+            }
+            catch {
+                Write-Debug "停止哈希任务失败: $($_.Exception.Message)"
+            }
+            finally {
+                $pendingJob.PowerShell.Dispose()
+            }
+        }
+
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+    }
+
+    return $hashRecordList.ToArray()
 }
 
 # 递归获取目录下所有普通文件；默认不包含隐藏项，传入 -s 时包含隐藏文件和隐藏文件夹。
@@ -991,6 +1409,24 @@ function Get-DirectoryLabel {
     return $name
 }
 
+# 使用 .NET 删除文件；删除前移除只读属性，避免大量删除时引入 Remove-Item 的额外开销。
+function Remove-FileSystemFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
+    )
+
+    if (-not [System.IO.File]::Exists($FilePath)) {
+        throw '文件已不存在。'
+    }
+
+    [System.IO.File]::SetAttributes($FilePath, [System.IO.FileAttributes]::Normal)
+    [System.IO.File]::Delete($FilePath)
+    if ([System.IO.File]::Exists($FilePath)) {
+        throw '删除后文件仍存在。'
+    }
+}
+
 # 获取文件所在目录的规范化路径，用于默认保留优先级判断。
 function Get-FileParentDirectoryPath {
     param(
@@ -998,7 +1434,7 @@ function Get-FileParentDirectoryPath {
         [System.IO.FileInfo]$File
     )
 
-    return ConvertTo-NormalizedDirectoryPath -Path (Split-Path -Parent $File.FullName)
+    return ConvertTo-NormalizedPath -Path (Split-Path -Parent $File.FullName)
 }
 
 # 统计目录路径层级；层级越少，默认保留优先级越高。
@@ -1008,7 +1444,14 @@ function Get-DirectoryPathDepth {
         [string]$Path
     )
 
-    return @($Path -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+    $depth = 0
+    foreach ($pathSegment in $Path.Split([char[]]@('\', '/'))) {
+        if (-not [string]::IsNullOrWhiteSpace($pathSegment)) {
+            $depth++
+        }
+    }
+
+    return $depth
 }
 
 # 按默认保留规则排序文件：目录越靠上越优先，同目录内文件名越短越优先。
@@ -1018,12 +1461,27 @@ function Get-FileListByKeepPriority {
         [System.IO.FileInfo[]]$FileList
     )
 
-    return $FileList |
-        Sort-Object @{ Expression = { Get-DirectoryPathDepth -Path (Get-FileParentDirectoryPath -File $_) }; Ascending = $true },
-                    @{ Expression = { (Get-FileParentDirectoryPath -File $_).Length }; Ascending = $true },
-                    @{ Expression = { $_.Name.Length }; Ascending = $true },
+    $keepPriorityRecordList = @(
+        foreach ($file in $FileList) {
+            $parentDirectoryPath = Get-FileParentDirectoryPath -File $file
+            [pscustomobject]@{
+                File             = $file
+                ParentDepth      = Get-DirectoryPathDepth -Path $parentDirectoryPath
+                ParentPathLength = $parentDirectoryPath.Length
+                NameLength       = $file.Name.Length
+                Name             = $file.Name
+                FullName         = $file.FullName
+            }
+        }
+    )
+
+    return $keepPriorityRecordList |
+        Sort-Object @{ Expression = { $_.ParentDepth }; Ascending = $true },
+                    @{ Expression = { $_.ParentPathLength }; Ascending = $true },
+                    @{ Expression = { $_.NameLength }; Ascending = $true },
                     @{ Expression = { $_.Name }; Ascending = $true },
-                    @{ Expression = { $_.FullName }; Ascending = $true }
+                    @{ Expression = { $_.FullName }; Ascending = $true } |
+        ForEach-Object { $_.File }
 }
 
 # 从一组重复文件中选出默认应保留的文件。
@@ -1033,7 +1491,12 @@ function Select-DefaultKeepFile {
         [System.IO.FileInfo[]]$FileList
     )
 
-    return Get-FileListByKeepPriority -FileList $FileList | Select-Object -First 1
+    $orderedFileList = @(Get-FileListByKeepPriority -FileList $FileList)
+    if ($orderedFileList.Count -eq 0) {
+        return $null
+    }
+
+    return $orderedFileList[0]
 }
 
 # 按单目录根路径、目录前缀或预先建立的映射获取文件显示路径。
@@ -1099,6 +1562,26 @@ function New-DeletionItemList {
     )
 }
 
+# 将文件加入指定键的小桶；用哈希表直接分组，避免大批量 Group-Object 的管道和对象开销。
+function Add-FileToGroupBucket {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$FileListByKey,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Key,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    if (-not $FileListByKey.ContainsKey($Key)) {
+        $FileListByKey[$Key] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    }
+
+    $FileListByKey[$Key].Add($File)
+}
+
 # 按文件大小、部分哈希、完整哈希分层筛选出内容完全一致的重复文件组。
 function Find-DuplicateFileGroup {
     param(
@@ -1129,74 +1612,102 @@ function Find-DuplicateFileGroup {
     Complete-DynamicStatusLine
 
     # 只有大小相同的文件才可能重复；不同大小的文件无需继续计算哈希。
-    $sameLengthGroups = @(
-        foreach ($size in $filesByLength.Keys) {
-            if ($filesByLength[$size].Count -gt 1) {
-                [pscustomobject]@{
-                    Name  = $size
-                    Count = $filesByLength[$size].Count
-                    Group = @($filesByLength[$size])
-                }
-            }
+    $sameLengthGroupList = New-Object System.Collections.Generic.List[object]
+    $partialHashCandidateCount = 0
+    foreach ($size in $filesByLength.Keys) {
+        $sameLengthFileList = $filesByLength[$size]
+        if ($sameLengthFileList.Count -gt 1) {
+            $sameLengthGroupList.Add($sameLengthFileList)
+            $partialHashCandidateCount += $sameLengthFileList.Count
         }
-    )
-    $partialHashCandidateCount = @($sameLengthGroups | ForEach-Object { $_.Group }).Count
-    Write-StageMessage "$($ProgressLabel)大小相同的候选文件数: $partialHashCandidateCount，候选大小组数: $($sameLengthGroups.Count)"
+    }
+
+    Write-StageMessage "$($ProgressLabel)大小相同的候选文件数: $partialHashCandidateCount，候选大小组数: $($sameLengthGroupList.Count)"
 
     $processedPartialHashCount = 0
     $lastPartialHashPercent = -1
     $hashProgressName = "$($ProgressLabel)哈希计算"
     $hashWarningList = New-DeferredScanWarningList
+    $fullHashCandidateGroupList = New-Object System.Collections.Generic.List[object]
 
-    foreach ($sizeGroup in $sameLengthGroups) {
-        $partialHashRecords = @(
-            foreach ($file in $sizeGroup.Group) {
-                $processedPartialHashCount++
-                Write-ProgressBar -Activity $hashProgressName -Status '正在筛选候选文件' -ProcessedCount $processedPartialHashCount -TotalCount $partialHashCandidateCount -LastPercent ([ref]$lastPartialHashPercent)
+    foreach ($sameLengthFileList in $sameLengthGroupList) {
+        $fileListByPartialHash = @{}
+        foreach ($partialHashRecord in @(Get-ContentHashRecordList `
+                    -FileList @($sameLengthFileList.ToArray()) `
+                    -HashKind 'Partial' `
+                    -Activity $hashProgressName `
+                    -Status '正在并行筛选候选文件' `
+                    -TotalCount $partialHashCandidateCount `
+                    -ProcessedCount ([ref]$processedPartialHashCount) `
+                    -LastPercent ([ref]$lastPartialHashPercent) `
+                    -WarningList $hashWarningList `
+                    -WarningMessage '跳过文件，无法计算部分哈希')) {
+            Add-FileToGroupBucket -FileListByKey $fileListByPartialHash -Key $partialHashRecord.Hash -File $partialHashRecord.File
+        }
 
-                try {
-                    [pscustomobject]@{
-                        File        = $file
-                        PartialHash = Get-PartialContentHash -File $file
-                    }
-                }
-                catch {
-                    Add-DeferredScanWarning -WarningList $hashWarningList -Message '跳过文件，无法计算部分哈希' -Path $file.FullName -Reason $_.Exception.Message
-                }
+        foreach ($partialHash in $fileListByPartialHash.Keys) {
+            $partialHashFileList = $fileListByPartialHash[$partialHash]
+            if ($partialHashFileList.Count -le 1) {
+                continue
             }
-        )
 
-        $partialHashGroups = @($partialHashRecords |
-            Group-Object -Property PartialHash |
-            Where-Object { $_.Count -gt 1 })
-
-        foreach ($partialHashGroup in $partialHashGroups) {
-            # 部分哈希只用于减少候选范围，最终仍按完整 SHA-256 分组确认。
-            $contentHashRecords = @(
-                foreach ($partialHashRecord in $partialHashGroup.Group) {
-                    try {
-                        [pscustomobject]@{
-                            File        = $partialHashRecord.File
-                            ContentHash = Get-FullContentHash -File $partialHashRecord.File
-                        }
-                    }
-                    catch {
-                        Add-DeferredScanWarning -WarningList $hashWarningList -Message '跳过文件，无法计算完整哈希' -Path $partialHashRecord.File.FullName -Reason $_.Exception.Message
-                    }
-                }
-            )
-
-            $contentHashGroups = @($contentHashRecords |
-                Group-Object -Property ContentHash |
-                Where-Object { $_.Count -gt 1 })
-
-            foreach ($contentHashGroup in $contentHashGroups) {
+            # 文件不大于两段采样总长时，部分哈希已按完整文件计算，可直接确认为重复文件组。
+            if (Test-PartialHashCoversFullFile -Length $partialHashFileList[0].Length) {
                 [pscustomobject]@{
-                    Hash  = $contentHashGroup.Name
-                    Files = @($contentHashGroup.Group | ForEach-Object { $_.File })
+                    Hash  = $partialHash
+                    Files = @($partialHashFileList.ToArray())
                 }
+                continue
+            }
+
+            $fullHashCandidateGroupList.Add($partialHashFileList.ToArray())
+        }
+    }
+
+    $fullHashCandidateCount = 0
+    foreach ($fullHashCandidateGroup in $fullHashCandidateGroupList) {
+        $fullHashCandidateCount += $fullHashCandidateGroup.Count
+    }
+
+    $processedFullHashCount = [Math]::Max(0, $partialHashCandidateCount - $fullHashCandidateCount)
+    $lastFullHashPercent = -1
+    foreach ($fullHashCandidateGroup in $fullHashCandidateGroupList) {
+        # 部分哈希只用于减少候选范围，最终仍按完整 SHA-256 分组确认。
+        $fileListByContentHash = @{}
+        foreach ($contentHashRecord in @(Get-ContentHashRecordList `
+                    -FileList @($fullHashCandidateGroup) `
+                    -HashKind 'Full' `
+                    -Activity $hashProgressName `
+                    -Status '正在并行确认完整哈希' `
+                    -TotalCount $partialHashCandidateCount `
+                    -ProcessedCount ([ref]$processedFullHashCount) `
+                    -LastPercent ([ref]$lastFullHashPercent) `
+                    -WarningList $hashWarningList `
+                    -WarningMessage '跳过文件，无法计算完整哈希')) {
+            Add-FileToGroupBucket -FileListByKey $fileListByContentHash -Key $contentHashRecord.Hash -File $contentHashRecord.File
+        }
+
+        foreach ($contentHash in $fileListByContentHash.Keys) {
+            $contentHashFileList = $fileListByContentHash[$contentHash]
+            if ($contentHashFileList.Count -le 1) {
+                continue
+            }
+
+            [pscustomobject]@{
+                Hash  = $contentHash
+                Files = @($contentHashFileList.ToArray())
             }
         }
+    }
+
+    if ($partialHashCandidateCount -gt 0) {
+        Write-ProgressBar `
+            -Activity $hashProgressName `
+            -Status '哈希计算完成' `
+            -ProcessedCount $partialHashCandidateCount `
+            -TotalCount $partialHashCandidateCount `
+            -LastPercent ([ref]$lastFullHashPercent) `
+            -Force
     }
 
     Complete-DynamicStatusLine
@@ -1440,7 +1951,7 @@ function Remove-DeletionItemList {
     $deletedItemList = New-Object System.Collections.Generic.List[object]
     foreach ($deletionItem in $DeletionItemList) {
         try {
-            Remove-Item -LiteralPath $deletionItem.File.FullName -Force -ErrorAction Stop
+            Remove-FileSystemFile -FilePath $deletionItem.File.FullName
             if (-not $Quiet) {
                 Write-Host "已删除: $($deletionItem.DisplayPath)" -ForegroundColor Magenta
             }
@@ -1625,13 +2136,18 @@ function New-SingleDirectoryDeletionPlan {
     foreach ($duplicateGroupRecord in Find-DuplicateFileGroup -FileList $scannedFiles -ProgressLabel '单目录') {
         $duplicateFiles = @($duplicateGroupRecord.Files)
         $defaultKeepFile = Select-DefaultKeepFile -FileList $duplicateFiles
-        $filesToDelete = @($duplicateFiles | Where-Object { $_.FullName -ne $defaultKeepFile.FullName })
+        $filesToDelete = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+        foreach ($duplicateFile in $duplicateFiles) {
+            if (-not $duplicateFile.FullName.Equals($defaultKeepFile.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $filesToDelete.Add($duplicateFile)
+            }
+        }
 
         [pscustomobject]@{
             Hash           = $duplicateGroupRecord.Hash
             KeepFile      = $defaultKeepFile
             KeepPathText  = Get-RelativePathText -File $defaultKeepFile -RootPath $RootPath
-            DeletionItems = New-DeletionItemList -FileList $filesToDelete -RootPath $RootPath
+            DeletionItems = New-DeletionItemList -FileList ($filesToDelete.ToArray()) -RootPath $RootPath
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1686,13 +2202,18 @@ function New-MergedDirectoryDeletionPlan {
     foreach ($duplicateGroupRecord in Find-DuplicateFileGroup -FileList $scannedFileList -ProgressLabel '多目录合并') {
         $duplicateFiles = @($duplicateGroupRecord.Files)
         $defaultKeepFile = Select-DefaultKeepFile -FileList $duplicateFiles
-        $filesToDelete = @($duplicateFiles | Where-Object { $_.FullName -ne $defaultKeepFile.FullName })
+        $filesToDelete = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+        foreach ($duplicateFile in $duplicateFiles) {
+            if (-not $duplicateFile.FullName.Equals($defaultKeepFile.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $filesToDelete.Add($duplicateFile)
+            }
+        }
 
         [pscustomobject]@{
             Hash           = $duplicateGroupRecord.Hash
             KeepFile       = $defaultKeepFile
             KeepPathText   = $displayPathByFullName[$defaultKeepFile.FullName]
-            DeletionItems  = New-DeletionItemList -FileList $filesToDelete -DisplayPathByFullName $displayPathByFullName
+            DeletionItems  = New-DeletionItemList -FileList ($filesToDelete.ToArray()) -DisplayPathByFullName $displayPathByFullName
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1759,9 +2280,14 @@ function Invoke-ManualDeletion {
         $manualDeletionItems = New-DeletionItemList -FileList $selectedFilesToDelete -RootPath $RootPath -DisplayPathByFullName $DisplayPathByFullName
 
         $deletionResult = Remove-DeletionItemList -DeletionItemList $manualDeletionItems -Quiet
+        $deletedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($deletedItem in @($deletionResult.DeletedItems)) {
+            [void]$deletedFilePathSet.Add($deletedItem.File.FullName)
+        }
+
         $deletedSelectionList = @(
             foreach ($selectedDeletionEntry in $selectedDeletionEntries) {
-                if (@($deletionResult.DeletedItems | Where-Object { $_.File.FullName -eq $selectedDeletionEntry.File.FullName }).Count -gt 0) {
+                if ($deletedFilePathSet.Contains($selectedDeletionEntry.File.FullName)) {
                     $selectedDeletionEntry
                 }
             }
@@ -2120,87 +2646,180 @@ function New-ReferenceDirectoryIndex {
     }
 }
 
-# 按参考文件完整路径缓存部分哈希，避免同一次运行中同一文件重复计算。
-function Get-CachedReferencePartialHash {
+# 按目标实际命中的文件大小，批量懒加载参考目录部分哈希索引。
+function Initialize-ReferencePartialHashIndexForLengthList {
     param(
         [Parameter(Mandatory = $true)]
         [object]$ReferenceIndex,
 
         [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo]$File
-    )
-
-    if ($ReferenceIndex.PartialHashByFullName.ContainsKey($File.FullName)) {
-        return $ReferenceIndex.PartialHashByFullName[$File.FullName]
-    }
-
-    $partialHash = Get-PartialContentHash -File $File
-    $ReferenceIndex.PartialHashByFullName[$File.FullName] = $partialHash
-    return $partialHash
-}
-
-# 按参考文件完整路径缓存完整哈希，避免同一次运行中同一文件重复计算。
-function Get-CachedReferenceFullHash {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$ReferenceIndex,
+        [AllowEmptyCollection()]
+        [long[]]$LengthList,
 
         [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo]$File
-    )
-
-    if ($ReferenceIndex.FullHashByFullName.ContainsKey($File.FullName)) {
-        return $ReferenceIndex.FullHashByFullName[$File.FullName]
-    }
-
-    $fullHash = Get-FullContentHash -File $File
-    $ReferenceIndex.FullHashByFullName[$File.FullName] = $fullHash
-    return $fullHash
-}
-
-# 按需为参考目录中的某个文件大小组建立部分哈希索引，并缓存结果供后续目标目录复用。
-function Get-ReferencePartialHashIndex {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$ReferenceIndex,
-
-        [Parameter(Mandatory = $true)]
-        [long]$Length,
-
-        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[object]]$WarningList
     )
 
-    if ($ReferenceIndex.PartialHashIndexByLength.ContainsKey($Length)) {
-        return $ReferenceIndex.PartialHashIndexByLength[$Length]
-    }
+    $pendingLengthList = New-Object System.Collections.Generic.List[long]
+    $referenceFileToHashList = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($length in $LengthList) {
+        if ($ReferenceIndex.PartialHashIndexByLength.ContainsKey($length)) {
+            continue
+        }
 
-    $partialHashIndex = @{}
-    if (-not $ReferenceIndex.FilesByLength.ContainsKey($Length)) {
-        $ReferenceIndex.PartialHashIndexByLength[$Length] = $partialHashIndex
-        return $partialHashIndex
-    }
+        if (-not $ReferenceIndex.FilesByLength.ContainsKey($length)) {
+            $ReferenceIndex.PartialHashIndexByLength[$length] = @{}
+            continue
+        }
 
-    $referenceFiles = @($ReferenceIndex.FilesByLength[$Length])
-    foreach ($referenceFile in $referenceFiles) {
-        try {
-            $partialHash = Get-CachedReferencePartialHash -ReferenceIndex $ReferenceIndex -File $referenceFile
-            if (-not $partialHashIndex.ContainsKey($partialHash)) {
-                $partialHashIndex[$partialHash] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+        $pendingLengthList.Add($length)
+        foreach ($referenceFile in @($ReferenceIndex.FilesByLength[$length])) {
+            if (-not $ReferenceIndex.PartialHashByFullName.ContainsKey($referenceFile.FullName)) {
+                $referenceFileToHashList.Add($referenceFile)
             }
-            $partialHashIndex[$partialHash].Add($referenceFile)
-        }
-        catch {
-            Add-DeferredScanWarning -WarningList $WarningList -Message '跳过参考文件，无法计算部分哈希' -Path $referenceFile.FullName -Reason $_.Exception.Message
         }
     }
 
-    $ReferenceIndex.PartialHashIndexByLength[$Length] = $partialHashIndex
-    return $partialHashIndex
+    if ($referenceFileToHashList.Count -gt 0) {
+        $processedReferencePartialHashCount = 0
+        $lastReferencePartialHashPercent = -1
+        foreach ($partialHashRecord in @(Get-ContentHashRecordList `
+                    -FileList $referenceFileToHashList.ToArray() `
+                    -HashKind 'Partial' `
+                    -Activity '参考目录懒加载哈希' `
+                    -Status '正在并行计算参考部分哈希' `
+                    -TotalCount $referenceFileToHashList.Count `
+                    -ProcessedCount ([ref]$processedReferencePartialHashCount) `
+                    -LastPercent ([ref]$lastReferencePartialHashPercent) `
+                    -WarningList $WarningList `
+                    -WarningMessage '跳过参考文件，无法计算部分哈希')) {
+            $ReferenceIndex.PartialHashByFullName[$partialHashRecord.File.FullName] = $partialHashRecord.Hash
+        }
+    }
+
+    foreach ($length in $pendingLengthList) {
+        $partialHashIndex = @{}
+        foreach ($referenceFile in @($ReferenceIndex.FilesByLength[$length])) {
+            if (-not $ReferenceIndex.PartialHashByFullName.ContainsKey($referenceFile.FullName)) {
+                continue
+            }
+
+            Add-FileToGroupBucket `
+                -FileListByKey $partialHashIndex `
+                -Key $ReferenceIndex.PartialHashByFullName[$referenceFile.FullName] `
+                -File $referenceFile
+        }
+
+        $ReferenceIndex.PartialHashIndexByLength[$length] = $partialHashIndex
+    }
 }
 
-# 按需为参考目录中的某个“文件大小 + 部分哈希”组建立完整哈希索引，并缓存结果供后续目标目录复用。
-function Get-ReferenceFullHashIndex {
+# 返回已缓存的参考目录部分哈希索引；调用方应先执行懒加载初始化。
+function Get-ReferencePartialHashIndexFromCache {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Length
+    )
+
+    if (-not $ReferenceIndex.PartialHashIndexByLength.ContainsKey($Length)) {
+        return @{}
+    }
+
+    return $ReferenceIndex.PartialHashIndexByLength[$Length]
+}
+
+# 按目标实际命中的“文件大小 + 部分哈希”，批量懒加载参考目录完整哈希索引。
+function Initialize-ReferenceFullHashIndexForMatchList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ReferenceIndex,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$MatchList,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$WarningList
+    )
+
+    $pendingMatchList = New-Object System.Collections.Generic.List[object]
+    $pendingMatchKeySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $referenceFileToHashList = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($match in $MatchList) {
+        if (Test-PartialHashCoversFullFile -Length $match.Length) {
+            continue
+        }
+
+        if (-not $ReferenceIndex.FullHashIndexCache.ContainsKey($match.Length)) {
+            $ReferenceIndex.FullHashIndexCache[$match.Length] = @{}
+        }
+
+        $fullHashIndexByPartialHash = $ReferenceIndex.FullHashIndexCache[$match.Length]
+        if ($fullHashIndexByPartialHash.ContainsKey($match.PartialHash)) {
+            continue
+        }
+
+        $matchKey = "$($match.Length)`0$($match.PartialHash)"
+        if (-not $pendingMatchKeySet.Add($matchKey)) {
+            continue
+        }
+
+        $partialHashIndex = Get-ReferencePartialHashIndexFromCache -ReferenceIndex $ReferenceIndex -Length $match.Length
+        if (-not $partialHashIndex.ContainsKey($match.PartialHash)) {
+            $fullHashIndexByPartialHash[$match.PartialHash] = @{}
+            continue
+        }
+
+        $pendingMatchList.Add($match)
+        foreach ($referenceFile in @($partialHashIndex[$match.PartialHash])) {
+            if (-not $ReferenceIndex.FullHashByFullName.ContainsKey($referenceFile.FullName)) {
+                $referenceFileToHashList.Add($referenceFile)
+            }
+        }
+    }
+
+    if ($referenceFileToHashList.Count -gt 0) {
+        $processedReferenceFullHashCount = 0
+        $lastReferenceFullHashPercent = -1
+        foreach ($fullHashRecord in @(Get-ContentHashRecordList `
+                    -FileList $referenceFileToHashList.ToArray() `
+                    -HashKind 'Full' `
+                    -Activity '参考目录懒加载哈希' `
+                    -Status '正在并行计算参考完整哈希' `
+                    -TotalCount $referenceFileToHashList.Count `
+                    -ProcessedCount ([ref]$processedReferenceFullHashCount) `
+                    -LastPercent ([ref]$lastReferenceFullHashPercent) `
+                    -WarningList $WarningList `
+                    -WarningMessage '跳过参考文件，无法计算完整哈希')) {
+            $ReferenceIndex.FullHashByFullName[$fullHashRecord.File.FullName] = $fullHashRecord.Hash
+        }
+    }
+
+    foreach ($match in $pendingMatchList) {
+        $partialHashIndex = Get-ReferencePartialHashIndexFromCache -ReferenceIndex $ReferenceIndex -Length $match.Length
+        $fullHashIndex = @{}
+        foreach ($referenceFile in @($partialHashIndex[$match.PartialHash])) {
+            if (-not $ReferenceIndex.FullHashByFullName.ContainsKey($referenceFile.FullName)) {
+                continue
+            }
+
+            Add-FileToGroupBucket `
+                -FileListByKey $fullHashIndex `
+                -Key $ReferenceIndex.FullHashByFullName[$referenceFile.FullName] `
+                -File $referenceFile
+        }
+
+        $ReferenceIndex.FullHashIndexCache[$match.Length][$match.PartialHash] = $fullHashIndex
+    }
+}
+
+# 返回已缓存的参考目录完整哈希索引；调用方应先执行懒加载初始化。
+function Get-ReferenceFullHashIndexFromCache {
     param(
         [Parameter(Mandatory = $true)]
         [object]$ReferenceIndex,
@@ -2209,44 +2828,19 @@ function Get-ReferenceFullHashIndex {
         [long]$Length,
 
         [Parameter(Mandatory = $true)]
-        [string]$PartialHash,
-
-        [Parameter(Mandatory = $false)]
-        [System.Collections.Generic.List[object]]$WarningList
+        [string]$PartialHash
     )
 
     if (-not $ReferenceIndex.FullHashIndexCache.ContainsKey($Length)) {
-        $ReferenceIndex.FullHashIndexCache[$Length] = @{}
+        return @{}
     }
 
-    $fullHashCacheByPartialHash = $ReferenceIndex.FullHashIndexCache[$Length]
-    if ($fullHashCacheByPartialHash.ContainsKey($PartialHash)) {
-        return $fullHashCacheByPartialHash[$PartialHash]
+    $fullHashIndexByPartialHash = $ReferenceIndex.FullHashIndexCache[$Length]
+    if (-not $fullHashIndexByPartialHash.ContainsKey($PartialHash)) {
+        return @{}
     }
 
-    $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $Length -WarningList $WarningList
-    $fullHashIndex = @{}
-    if (-not $partialHashIndex.ContainsKey($PartialHash)) {
-        $fullHashCacheByPartialHash[$PartialHash] = $fullHashIndex
-        return $fullHashIndex
-    }
-
-    $referenceFiles = @($partialHashIndex[$PartialHash])
-    foreach ($referenceFile in $referenceFiles) {
-        try {
-            $fullHash = Get-CachedReferenceFullHash -ReferenceIndex $ReferenceIndex -File $referenceFile
-            if (-not $fullHashIndex.ContainsKey($fullHash)) {
-                $fullHashIndex[$fullHash] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-            }
-            $fullHashIndex[$fullHash].Add($referenceFile)
-        }
-        catch {
-            Add-DeferredScanWarning -WarningList $WarningList -Message '跳过参考文件，无法计算完整哈希' -Path $referenceFile.FullName -Reason $_.Exception.Message
-        }
-    }
-
-    $fullHashCacheByPartialHash[$PartialHash] = $fullHashIndex
-    return $fullHashIndex
+    return $fullHashIndexByPartialHash[$PartialHash]
 }
 
 # 为参考目录模式生成删除计划：参考目录只参与比较，目标目录才会进入删除列表。
@@ -2270,60 +2864,125 @@ function New-ReferenceDirectoryDeletionPlan {
     $referenceFilesByLength = $ReferenceIndex.FilesByLength
     $targetPathPrefix = Get-DirectoryLabel -RootPath $TargetRootPath
 
-    Write-StageMessage "参考目录模式使用懒加载索引筛选目标目录..."
+    Write-StageMessage "参考目录模式使用批量懒加载索引筛选目标目录..."
     $matchedTargetFilesByHash = @{}
+    $matchWarningList = New-DeferredScanWarningList
+    $targetPartialCandidateFileList = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $targetCandidateLengthSet = @{}
+
     $processedTargetFileCount = 0
     $lastTargetMatchPercent = -1
-    $matchWarningList = New-DeferredScanWarningList
     foreach ($file in $targetFileList) {
         $processedTargetFileCount++
-        Write-ProgressBar -Activity '目标目录重复文件筛选' -Status '正在匹配参考目录索引' -ProcessedCount $processedTargetFileCount -TotalCount $targetFileList.Count -LastPercent ([ref]$lastTargetMatchPercent)
+        Write-ProgressBar -Activity '目标目录重复文件筛选' -Status '正在筛选目标大小候选' -ProcessedCount $processedTargetFileCount -TotalCount $targetFileList.Count -LastPercent ([ref]$lastTargetMatchPercent)
 
         # 目标文件只有在参考目录存在相同大小文件时，才需要进入后续哈希比较。
         if (-not $referenceFilesByLength.ContainsKey($file.Length)) {
             continue
         }
 
-        try {
-            $partialHash = Get-PartialContentHash -File $file
-        }
-        catch {
-            Add-DeferredScanWarning -WarningList $matchWarningList -Message '跳过文件，无法计算部分哈希' -Path $file.FullName -Reason $_.Exception.Message
-            continue
-        }
+        $targetPartialCandidateFileList.Add($file)
+        $targetCandidateLengthSet[$file.Length] = $true
+    }
 
-        $partialHashIndex = Get-ReferencePartialHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -WarningList $matchWarningList
+    Initialize-ReferencePartialHashIndexForLengthList `
+        -ReferenceIndex $ReferenceIndex `
+        -LengthList ([long[]]@($targetCandidateLengthSet.Keys)) `
+        -WarningList $matchWarningList
+
+    $processedTargetPartialHashCount = 0
+    $lastTargetPartialHashPercent = -1
+    $targetFullCandidateList = New-Object System.Collections.Generic.List[object]
+    foreach ($partialHashRecord in @(Get-ContentHashRecordList `
+                -FileList $targetPartialCandidateFileList.ToArray() `
+                -HashKind 'Partial' `
+                -Activity '目标目录重复文件筛选' `
+                -Status '正在并行计算目标部分哈希' `
+                -TotalCount $targetPartialCandidateFileList.Count `
+                -ProcessedCount ([ref]$processedTargetPartialHashCount) `
+                -LastPercent ([ref]$lastTargetPartialHashPercent) `
+                -WarningList $matchWarningList `
+                -WarningMessage '跳过文件，无法计算部分哈希')) {
+        $file = $partialHashRecord.File
+        $partialHash = $partialHashRecord.Hash
+        $partialHashIndex = Get-ReferencePartialHashIndexFromCache -ReferenceIndex $ReferenceIndex -Length $file.Length
         if (-not $partialHashIndex.ContainsKey($partialHash)) {
             continue
         }
 
-        $fullHashIndex = Get-ReferenceFullHashIndex -ReferenceIndex $ReferenceIndex -Length $file.Length -PartialHash $partialHash -WarningList $matchWarningList
+        if (Test-PartialHashCoversFullFile -Length $file.Length) {
+            $fullHash = $partialHash
+            if (-not $matchedTargetFilesByHash.ContainsKey($fullHash)) {
+                $targetFileListForHash = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+                $matchedTargetFilesByHash[$fullHash] = [pscustomobject]@{
+                    Hash           = $fullHash
+                    ReferenceFiles = @($partialHashIndex[$partialHash])
+                    TargetFiles    = $targetFileListForHash
+                }
+            }
+
+            $matchedTargetFilesByHash[$fullHash].TargetFiles.Add($file)
+            continue
+        }
+
+        $targetFullCandidateList.Add([pscustomobject]@{
+                File        = $file
+                Length      = $file.Length
+                PartialHash = $partialHash
+            })
+    }
+
+    Initialize-ReferenceFullHashIndexForMatchList `
+        -ReferenceIndex $ReferenceIndex `
+        -MatchList $targetFullCandidateList.ToArray() `
+        -WarningList $matchWarningList
+
+    $targetFullCandidateContextByFullName = @{}
+    $targetFullCandidateFileList = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($targetFullCandidate in $targetFullCandidateList) {
+        $fullHashIndex = Get-ReferenceFullHashIndexFromCache `
+            -ReferenceIndex $ReferenceIndex `
+            -Length $targetFullCandidate.Length `
+            -PartialHash $targetFullCandidate.PartialHash
         if ($fullHashIndex.Count -eq 0) {
             continue
         }
 
-        try {
-            $fullHash = Get-FullContentHash -File $file
-        }
-        catch {
-            Add-DeferredScanWarning -WarningList $matchWarningList -Message '跳过文件，无法计算完整哈希' -Path $file.FullName -Reason $_.Exception.Message
+        $targetFullCandidateContextByFullName[$targetFullCandidate.File.FullName] = $targetFullCandidate
+        $targetFullCandidateFileList.Add($targetFullCandidate.File)
+    }
+
+    $processedTargetFullHashCount = 0
+    $lastTargetFullHashPercent = -1
+    foreach ($fullHashRecord in @(Get-ContentHashRecordList `
+                -FileList $targetFullCandidateFileList.ToArray() `
+                -HashKind 'Full' `
+                -Activity '目标目录重复文件筛选' `
+                -Status '正在并行计算目标完整哈希' `
+                -TotalCount $targetFullCandidateFileList.Count `
+                -ProcessedCount ([ref]$processedTargetFullHashCount) `
+                -LastPercent ([ref]$lastTargetFullHashPercent) `
+                -WarningList $matchWarningList `
+                -WarningMessage '跳过文件，无法计算完整哈希')) {
+        $targetFullCandidate = $targetFullCandidateContextByFullName[$fullHashRecord.File.FullName]
+        $fullHashIndex = Get-ReferenceFullHashIndexFromCache `
+            -ReferenceIndex $ReferenceIndex `
+            -Length $targetFullCandidate.Length `
+            -PartialHash $targetFullCandidate.PartialHash
+        if (-not $fullHashIndex.ContainsKey($fullHashRecord.Hash)) {
             continue
         }
 
-        if (-not $fullHashIndex.ContainsKey($fullHash)) {
-            continue
-        }
-
-        if (-not $matchedTargetFilesByHash.ContainsKey($fullHash)) {
+        if (-not $matchedTargetFilesByHash.ContainsKey($fullHashRecord.Hash)) {
             $targetFileListForHash = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-            $matchedTargetFilesByHash[$fullHash] = [pscustomobject]@{
-                Hash           = $fullHash
-                ReferenceFiles = @($fullHashIndex[$fullHash])
+            $matchedTargetFilesByHash[$fullHashRecord.Hash] = [pscustomobject]@{
+                Hash           = $fullHashRecord.Hash
+                ReferenceFiles = @($fullHashIndex[$fullHashRecord.Hash])
                 TargetFiles    = $targetFileListForHash
             }
         }
 
-        $matchedTargetFilesByHash[$fullHash].TargetFiles.Add($file)
+        $matchedTargetFilesByHash[$fullHashRecord.Hash].TargetFiles.Add($fullHashRecord.File)
     }
 
     Complete-DynamicStatusLine
@@ -2403,10 +3062,17 @@ function Invoke-DuplicateScanRun {
     }
 
     $resolvedPathList = @(Resolve-InputDirectoryList -PathList $InputPathList)
-    Assert-IndependentDirectorySet -RootPathList $resolvedPathList
+    if ($resolvedPathList.Count -lt $minimumPathCount) {
+        throw "当前模式至少需要输入 $minimumPathCount 个不重复目录。"
+    }
 
     if ($UseReferenceMode) {
-        return (Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList @($resolvedPathList | Select-Object -Skip 1))
+        $targetRootPathList = @()
+        if ($resolvedPathList.Count -gt 1) {
+            $targetRootPathList = @($resolvedPathList[1..($resolvedPathList.Count - 1)])
+        }
+
+        return (Invoke-ReferenceDirectoryMode -ReferenceRootPath $resolvedPathList[0] -TargetRootPathList $targetRootPathList)
     }
     elseif ($UseAggregateMode) {
         return (Invoke-MergedDirectoryMode -RootPathList $resolvedPathList)

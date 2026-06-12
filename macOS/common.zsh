@@ -196,6 +196,8 @@ _common_collect_directory_files() {
 }
 
 # 从输入参数收集文件，结果写入 reply。
+# 调用格式为: _common_collect_input_files scan_scope unsupported_kind ext... -- input...
+# `--` 用来分隔扩展名列表和实际输入路径，避免路径刚好像扩展名时产生歧义。
 # 文件参数会直接校验扩展名；目录参数会按 scan_scope 扫描后再过滤。
 _common_collect_input_files() {
     emulate -L zsh -o typeset_silent
@@ -204,8 +206,6 @@ _common_collect_input_files() {
     local unsupported_kind="$2"
     shift 2
 
-    # 参数格式: scan_scope unsupported_kind ext... -- input...
-    # 用 -- 分隔扩展名和实际路径，避免路径刚好像扩展名时产生歧义。
     local -a allowed_extensions=()
     while [[ $# -gt 0 && "$1" != "--" ]]; do
         allowed_extensions+=("${1:l}")

@@ -1117,7 +1117,7 @@ function Resolve-IndependentInputDirectoryList {
     }
 }
 
-# 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段是绝对路径时按空格分隔。
+# 拆分交互输入的路径行：英文引号用于包裹含空格或分隔符的路径；路径可用英文分号分隔，也可在下一个片段是绝对路径时按空格分隔。
 function Split-InteractivePathInput {
     param(
         [Parameter(Mandatory = $true)]

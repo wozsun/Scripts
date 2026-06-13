@@ -83,7 +83,8 @@ function Show-HelpText {
 参数：
   Path
     一个或多个文件或文件夹绝对路径。文件路径会直接转换；文件夹路径会递归扫描。
-    未提供时会引导交互输入，交互时可在同一行输入多个路径；路径含空格时，请使用英文引号包裹路径。
+    命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径。
+    未提供时会引导交互输入，交互时可在同一行输入多个路径；交互输入中路径含空格或英文分号时，也请使用英文引号包裹路径。
 
   -s
     包含隐藏文件和隐藏文件夹。默认只扫描未隐藏项。
@@ -122,7 +123,7 @@ function Resolve-OfficeInputPath {
         throw "$ParameterName 必须只能解析到一个文件或文件夹。"
     }
 
-    throw "$ParameterName 无法读取: $normalizedPathText。原因: $($resolvedResult.Error)"
+    throw "$ParameterName 无法读取: $normalizedPathText。原因: $($resolvedResult.Error)。命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径。"
 }
 
 # 逐个校验 Office 转换输入路径，自动去重后返回文件系统对象。
@@ -819,7 +820,7 @@ if ($Help) {
 if ($null -eq $PathList -or $PathList.Count -eq 0) {
     # 未传入路径时，引导用户输入文件或文件夹，直接回车则安全退出。
     Write-Host "请输入文件或目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车退出；输入 0 退出脚本。" -ForegroundColor DarkGray
     $PathInputRaw = Read-ColoredLine -Prompt 'Path: '
     if ($null -eq $PathInputRaw) {

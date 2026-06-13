@@ -89,7 +89,7 @@ function Show-HelpText {
 规则：
   支持 .zip、.rar 和 .7z 压缩包。
   .zip 使用 .NET 原生能力解压，并对旧中文 ZIP 文件名编码做 GBK 回退；.rar / .7z 优先使用 Windows 内置 tar.exe，失败或缺失时回退到 7-Zip 或 WinRAR；.rar 还会尝试 UnRAR。
-  输入路径必须是 Windows 文件或文件夹绝对路径；路径含空格时，请使用英文引号包裹路径。
+  输入路径必须是 Windows 文件或文件夹绝对路径；命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径。
   多个输入路径可包含相同或互相包含的目录，脚本会按压缩包真实路径自动去重。
   每个压缩包会解压到自身所在目录下的同名文件夹。
   如果目标文件夹名已存在，则自动追加序号，例如 Archive (2)，不会覆盖已有文件夹或文件。
@@ -278,7 +278,7 @@ function Get-ArchiveExtractorList {
 # 交互读取一个或多个输入路径。
 function Read-InteractivePathList {
     Write-Host "请输入 .zip / .rar / .7z 压缩包或目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行或退出；输入 0 退出脚本。" -ForegroundColor DarkGray
 
     $inputItemList = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()

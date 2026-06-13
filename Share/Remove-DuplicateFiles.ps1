@@ -113,7 +113,7 @@ function Show-HelpText {
   powershell -File .\Remove-DuplicateFiles.ps1 -c [-s] [-yes] [ReferencePath] [TargetPath1] [TargetPath2 ...]
 
 参数：
-  Path   文件夹绝对路径；路径含空格时，请使用英文引号包裹路径。
+  Path   文件夹绝对路径；命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径。
   -a     多目录合并模式，把多个目录视作一个大目录。
   -c     参考目录模式；第一个目录为参考目录，其余为目标目录。
   -s     包含隐藏文件和隐藏文件夹。
@@ -130,7 +130,7 @@ function Show-HelpText {
   单目录和多目录合并模式可默认删除、手动删除、跳过本次操作或退出。
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除、跳过本次操作或退出。
-  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。
+  交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。
   重复文件候选哈希计算默认使用 8 个并发 worker；每个 worker 批量处理文件，可修改脚本顶部 $HashParallelThrottleLimit 调整，设为 1 可退回串行。
 '@
 }
@@ -540,7 +540,7 @@ function Test-WindowsAbsolutePath {
     return ($PathText -match '^[a-zA-Z]:[\\/]' -or $PathText -match '^[\\/]{2}[^\\/]+[\\/]+[^\\/]')
 }
 
-# 拆分交互输入的路径行：英文引号用于包裹含空格路径；路径可用英文分号分隔，也可在下一个片段看起来是绝对路径时按空格分隔。
+# 拆分交互输入的路径行：英文引号用于包裹含空格或分隔符的路径；路径可用英文分号分隔，也可在下一个片段看起来是绝对路径时按空格分隔。
 function Split-InteractivePathInput {
     param(
         [Parameter(Mandatory = $true)]
@@ -646,7 +646,7 @@ function Resolve-InputDirectory {
     }
 
     if (-not [System.IO.Directory]::Exists($fullPath)) {
-        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；多个路径可分行输入，或在同一行用空格/英文分号分隔；路径含空格时，请使用英文引号包裹路径。"
+        throw "$ParameterName 不存在或无法访问: $normalizedPathText。请确认路径存在；命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径；交互输入多个路径可分行，或在同一行用空格/英文分号分隔。"
     }
 
     return ([System.IO.DirectoryInfo]::new($fullPath)).FullName
@@ -739,7 +739,7 @@ function Read-InteractivePathList {
     $inputPathList = New-Object System.Collections.Generic.List[string]
     Write-Host "进入$ModePrompt。" -ForegroundColor Cyan
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Yellow
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行；输入 0 返回上级菜单；输入 00 退出脚本。" -ForegroundColor DarkGray
 
     while ($true) {

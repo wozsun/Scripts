@@ -53,7 +53,7 @@ function Show-HelpText {
   pwsh -File .\Remove-EmptyFolders.ps1 [-s] [-yes] [Path1] [Path2 ...]
 
 参数：
-  Path   一个或多个文件夹绝对路径；未提供时会引导交互输入；路径含空格时，请使用英文引号包裹路径。
+  Path   一个或多个文件夹绝对路径；未提供时会引导交互输入；命令行传参时，路径包含空格、括号等 PowerShell 特殊字符，请使用英文引号包裹路径。
   -s     把隐藏文件夹也作为删除候选；空目录判断始终会检查隐藏项和系统项。
   -yes   跳过详细预览和菜单，输出汇总后等待 10 秒，再执行默认删除。
   -h     显示帮助信息。
@@ -114,7 +114,7 @@ function Resolve-InputDirectoryList {
 # 交互读取一个或多个目录路径。
 function Read-InteractiveDirectoryList {
     Write-Host "请输入目录绝对路径。可在同一行输入多个路径。" -ForegroundColor Cyan
-    Write-Host "多个路径可用空格或英文分号分隔；路径含空格时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
+    Write-Host "多个路径可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。" -ForegroundColor DarkGray
     Write-Host "直接回车开始执行或退出；输入 0 退出脚本。" -ForegroundColor DarkGray
 
     $pathList = [System.Collections.Generic.List[string]]::new()

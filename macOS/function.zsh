@@ -514,7 +514,7 @@ EOF
     local -i quality_step=5
     local -i max_size_kb=500
     local -i max_size_bytes=$((max_size_kb * 1024))
-    local -i max_short_side=3072
+    local -i max_short_side=3240
     local -i max_long_side=4500
     local -i enforce_size_limit=1
 

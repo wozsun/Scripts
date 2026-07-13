@@ -96,6 +96,7 @@ function Show-HelpText {
   多个单目录逐个操作时，0 跳过当前目录，00 退出脚本。
   参考目录模式只删除目标目录文件，可默认删除、跳过本次操作或退出。
   交互输入多个路径时可分行，也可用空格或英文分号分隔；路径含空格或英文分号时，请使用英文引号包裹路径。
+  输入根目录不能是符号链接或目录联接点；删除前会重新核对保留文件与待删文件的完整 SHA-256。
   重复文件候选哈希计算默认使用 8 个并发 worker；每个 worker 批量处理文件，可修改脚本顶部 $HashParallelThrottleLimit 调整，设为 1 可退回串行。
 '@
 }
@@ -635,16 +636,38 @@ function Get-ContentHashRecordList {
     }
 
     $batchCount = [Math]::Min($effectiveThrottleLimit, $FileList.Count)
-    $batchSize = [Math]::Max(1, [int][Math]::Ceiling($FileList.Count / [double]$batchCount))
-    $filePathBatchList = [System.Collections.Generic.List[string[]]]::new()
-    for ($batchStartIndex = 0; $batchStartIndex -lt $FileList.Count; $batchStartIndex += $batchSize) {
-        $batchPathList = [System.Collections.Generic.List[string]]::new()
-        $batchEndIndex = [Math]::Min($FileList.Count - 1, $batchStartIndex + $batchSize - 1)
-        for ($fileIndex = $batchStartIndex; $fileIndex -le $batchEndIndex; $fileIndex++) {
-            $batchPathList.Add($FileList[$fileIndex].FullName)
-        }
+    $batchPathBuilderList = [System.Collections.Generic.List[object]]::new()
+    $batchByteCountList = [long[]]::new($batchCount)
+    for ($batchIndex = 0; $batchIndex -lt $batchCount; $batchIndex++) {
+        $batchPathBuilderList.Add([System.Collections.Generic.List[string]]::new())
+    }
 
-        $filePathBatchList.Add($batchPathList.ToArray())
+    if ($HashKind -eq 'Full') {
+        # 完整哈希成本主要由字节数决定；按文件大小贪心分配，减少大文件集中到同一 worker 的长尾。
+        foreach ($file in @($FileList | Sort-Object -Property Length -Descending)) {
+            $targetBatchIndex = 0
+            for ($batchIndex = 1; $batchIndex -lt $batchCount; $batchIndex++) {
+                if ($batchByteCountList[$batchIndex] -lt $batchByteCountList[$targetBatchIndex]) {
+                    $targetBatchIndex = $batchIndex
+                }
+            }
+
+            $batchPathBuilderList[$targetBatchIndex].Add($file.FullName)
+            $batchByteCountList[$targetBatchIndex] += [long]$file.Length
+        }
+    }
+    else {
+        # 部分哈希读取量接近固定，按文件数量轮询分配即可。
+        for ($fileIndex = 0; $fileIndex -lt $FileList.Count; $fileIndex++) {
+            $batchPathBuilderList[$fileIndex % $batchCount].Add($FileList[$fileIndex].FullName)
+        }
+    }
+
+    $filePathBatchList = [System.Collections.Generic.List[string[]]]::new()
+    foreach ($batchPathBuilder in $batchPathBuilderList) {
+        if ($batchPathBuilder.Count -gt 0) {
+            $filePathBatchList.Add($batchPathBuilder.ToArray())
+        }
     }
 
     $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $effectiveThrottleLimit)
@@ -888,7 +911,7 @@ function Get-FileDisplayPath {
     return $File.FullName
 }
 
-# 将待删除文件封装为包含文件对象和显示路径的删除项。
+# 将待删除文件封装为包含显示路径、预期哈希和保留文件列表的删除项。
 function New-DeletionItemList {
     param(
         [Parameter(Mandatory = $true)]
@@ -901,7 +924,13 @@ function New-DeletionItemList {
         [string]$PathPrefix,
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$DisplayPathByFullName
+        [hashtable]$DisplayPathByFullName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedHash,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo[]]$KeepFileList
     )
 
     return @(
@@ -916,9 +945,11 @@ function New-DeletionItemList {
             }
 
             [pscustomobject]@{
-                File        = $_
-                DisplayPath = $displayPath
-                ByteCount   = $byteCount
+                File         = $_
+                DisplayPath  = $displayPath
+                ByteCount    = $byteCount
+                ExpectedHash = $ExpectedHash
+                KeepFileList = $KeepFileList
             }
         }
     )
@@ -984,27 +1015,42 @@ function Find-DuplicateFileGroup {
 
     Write-StageMessage "$($ProgressLabel)大小相同的候选文件数: $partialHashCandidateCount，候选大小组数: $($sameLengthGroupList.Count)"
 
+    $partialHashCandidateFileList = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    foreach ($sameLengthFileList in $sameLengthGroupList) {
+        foreach ($file in $sameLengthFileList) {
+            $partialHashCandidateFileList.Add($file)
+        }
+    }
+
     $processedPartialHashCount = 0
     $lastPartialHashPercent = -1
     $hashProgressName = "$($ProgressLabel)哈希计算"
     $hashWarningList = New-DeferredScanWarningList
     $fullHashCandidateGroupList = [System.Collections.Generic.List[object]]::new()
+    $fileListByLengthAndPartialHash = @{}
 
-    foreach ($sameLengthFileList in $sameLengthGroupList) {
-        $fileListByPartialHash = @{}
-        foreach ($partialHashRecord in @(Get-ContentHashRecordList `
-                    -FileList @($sameLengthFileList.ToArray()) `
-                    -HashKind 'Partial' `
-                    -Activity $hashProgressName `
-                    -Status '正在并行筛选候选文件' `
-                    -TotalCount $partialHashCandidateCount `
-                    -ProcessedCount ([ref]$processedPartialHashCount) `
-                    -LastPercent ([ref]$lastPartialHashPercent) `
-                    -WarningList $hashWarningList `
-                    -WarningMessage '跳过文件，无法计算部分哈希')) {
-            Add-FileToGroupBucket -FileListByKey $fileListByPartialHash -Key $partialHashRecord.Hash -File $partialHashRecord.File
+    foreach ($partialHashRecord in @(Get-ContentHashRecordList `
+                -FileList $partialHashCandidateFileList.ToArray() `
+                -HashKind 'Partial' `
+                -Activity $hashProgressName `
+                -Status '正在并行筛选候选文件' `
+                -TotalCount $partialHashCandidateCount `
+                -ProcessedCount ([ref]$processedPartialHashCount) `
+                -LastPercent ([ref]$lastPartialHashPercent) `
+                -WarningList $hashWarningList `
+                -WarningMessage '跳过文件，无法计算部分哈希')) {
+        $lengthKey = [long]$partialHashRecord.File.Length
+        if (-not $fileListByLengthAndPartialHash.ContainsKey($lengthKey)) {
+            $fileListByLengthAndPartialHash[$lengthKey] = @{}
         }
 
+        Add-FileToGroupBucket `
+            -FileListByKey $fileListByLengthAndPartialHash[$lengthKey] `
+            -Key $partialHashRecord.Hash `
+            -File $partialHashRecord.File
+    }
+
+    foreach ($fileListByPartialHash in $fileListByLengthAndPartialHash.Values) {
         foreach ($partialHash in $fileListByPartialHash.Keys) {
             $partialHashFileList = $fileListByPartialHash[$partialHash]
             if ($partialHashFileList.Count -le 1) {
@@ -1025,28 +1071,39 @@ function Find-DuplicateFileGroup {
     }
 
     $fullHashCandidateCount = 0
+    $fullHashCandidateFileList = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
     foreach ($fullHashCandidateGroup in $fullHashCandidateGroupList) {
         $fullHashCandidateCount += $fullHashCandidateGroup.Count
+        foreach ($file in $fullHashCandidateGroup) {
+            $fullHashCandidateFileList.Add($file)
+        }
     }
 
     $processedFullHashCount = [Math]::Max(0, $partialHashCandidateCount - $fullHashCandidateCount)
     $lastFullHashPercent = -1
-    foreach ($fullHashCandidateGroup in $fullHashCandidateGroupList) {
-        # 部分哈希只用于减少候选范围，最终仍按完整 SHA-256 分组确认。
-        $fileListByContentHash = @{}
-        foreach ($contentHashRecord in @(Get-ContentHashRecordList `
-                    -FileList @($fullHashCandidateGroup) `
-                    -HashKind 'Full' `
-                    -Activity $hashProgressName `
-                    -Status '正在并行确认完整哈希' `
-                    -TotalCount $partialHashCandidateCount `
-                    -ProcessedCount ([ref]$processedFullHashCount) `
-                    -LastPercent ([ref]$lastFullHashPercent) `
-                    -WarningList $hashWarningList `
-                    -WarningMessage '跳过文件，无法计算完整哈希')) {
-            Add-FileToGroupBucket -FileListByKey $fileListByContentHash -Key $contentHashRecord.Hash -File $contentHashRecord.File
+    $fileListByLengthAndContentHash = @{}
+    foreach ($contentHashRecord in @(Get-ContentHashRecordList `
+                -FileList $fullHashCandidateFileList.ToArray() `
+                -HashKind 'Full' `
+                -Activity $hashProgressName `
+                -Status '正在并行确认完整哈希' `
+                -TotalCount $partialHashCandidateCount `
+                -ProcessedCount ([ref]$processedFullHashCount) `
+                -LastPercent ([ref]$lastFullHashPercent) `
+                -WarningList $hashWarningList `
+                -WarningMessage '跳过文件，无法计算完整哈希')) {
+        $lengthKey = [long]$contentHashRecord.File.Length
+        if (-not $fileListByLengthAndContentHash.ContainsKey($lengthKey)) {
+            $fileListByLengthAndContentHash[$lengthKey] = @{}
         }
 
+        Add-FileToGroupBucket `
+            -FileListByKey $fileListByLengthAndContentHash[$lengthKey] `
+            -Key $contentHashRecord.Hash `
+            -File $contentHashRecord.File
+    }
+
+    foreach ($fileListByContentHash in $fileListByLengthAndContentHash.Values) {
         foreach ($contentHash in $fileListByContentHash.Keys) {
             $contentHashFileList = $fileListByContentHash[$contentHash]
             if ($contentHashFileList.Count -le 1) {
@@ -1296,7 +1353,30 @@ function Read-ManualDeletionSelection {
     }
 }
 
-# 执行一批删除项，并返回实际删除与失败数量。
+# 获取文件当前完整哈希并缓存结果，供删除前安全复核复用。
+function Get-CachedFullContentHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$HashByPath
+    )
+
+    if ($HashByPath.ContainsKey($FilePath)) {
+        return $HashByPath[$FilePath]
+    }
+
+    if (-not (Test-FileSystemFile -Path $FilePath)) {
+        throw "文件已不存在: $FilePath"
+    }
+
+    $currentHash = Get-FullContentHash -File ([System.IO.FileInfo]::new($FilePath))
+    $HashByPath[$FilePath] = $currentHash
+    return $currentHash
+}
+
+# 执行一批删除项；删除前重新确认至少一份保留文件和待删文件仍匹配原完整哈希。
 function Remove-DeletionItemList {
     param(
         [Parameter(Mandatory = $true)]
@@ -1309,13 +1389,34 @@ function Remove-DeletionItemList {
     $deletedFileCount = 0
     $failedFileCount = 0
     $deletedItemList = [System.Collections.Generic.List[object]]::new()
+    $currentHashByPath = @{}
     foreach ($deletionItem in $DeletionItemList) {
         try {
-            if (-not (Test-FileSystemFile -Path $deletionItem.File.FullName)) {
-                throw '文件已不存在。'
+            $hasValidKeepFile = $false
+            foreach ($keepFile in @($deletionItem.KeepFileList)) {
+                try {
+                    $keepHash = Get-CachedFullContentHash -FilePath $keepFile.FullName -HashByPath $currentHashByPath
+                    if ($keepHash.Equals($deletionItem.ExpectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $hasValidKeepFile = $true
+                        break
+                    }
+                }
+                catch {
+                    Write-Debug "保留文件复核失败: $($keepFile.FullName)。原因: $($_.Exception.Message)"
+                }
             }
 
-            Remove-FileSystemItem -Path $deletionItem.File.FullName
+            if (-not $hasValidKeepFile) {
+                throw '未找到仍与扫描结果一致的保留文件，已拒绝删除。'
+            }
+
+            $deletionFilePath = $deletionItem.File.FullName
+            $currentDeletionHash = Get-CachedFullContentHash -FilePath $deletionFilePath -HashByPath $currentHashByPath
+            if (-not $currentDeletionHash.Equals($deletionItem.ExpectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw '待删文件内容已变化，已拒绝删除。'
+            }
+
+            Remove-FileSystemItem -Path $deletionFilePath
             if (-not $Quiet) {
                 Write-Host "已删除: $($deletionItem.DisplayPath)" -ForegroundColor Magenta
             }
@@ -1475,7 +1576,11 @@ function New-SingleDirectoryDeletionPlan {
             Hash           = $duplicateGroupRecord.Hash
             KeepFile      = $defaultKeepFile
             KeepPathText  = Get-RelativePathText -RootPath $RootPath -FilePath $defaultKeepFile.FullName
-            DeletionItems = New-DeletionItemList -FileList ($filesToDelete.ToArray()) -RootPath $RootPath
+            DeletionItems = New-DeletionItemList `
+                -FileList ($filesToDelete.ToArray()) `
+                -RootPath $RootPath `
+                -ExpectedHash $duplicateGroupRecord.Hash `
+                -KeepFileList @($defaultKeepFile)
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1541,7 +1646,11 @@ function New-MergedDirectoryDeletionPlan {
             Hash           = $duplicateGroupRecord.Hash
             KeepFile       = $defaultKeepFile
             KeepPathText   = $displayPathByFullName[$defaultKeepFile.FullName]
-            DeletionItems  = New-DeletionItemList -FileList ($filesToDelete.ToArray()) -DisplayPathByFullName $displayPathByFullName
+            DeletionItems  = New-DeletionItemList `
+                -FileList ($filesToDelete.ToArray()) `
+                -DisplayPathByFullName $displayPathByFullName `
+                -ExpectedHash $duplicateGroupRecord.Hash `
+                -KeepFileList @($defaultKeepFile)
             DuplicateFiles = $duplicateFiles
         }
     }
@@ -1605,7 +1714,22 @@ function Invoke-ManualDeletion {
             continue
         }
 
-        $manualDeletionItems = New-DeletionItemList -FileList $selectedFilesToDelete -RootPath $RootPath -DisplayPathByFullName $DisplayPathByFullName
+        $selectedFilePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($selectedFile in $selectedFilesToDelete) {
+            [void]$selectedFilePathSet.Add($selectedFile.FullName)
+        }
+
+        $keepFileList = @(
+            $deletionPlan.DuplicateFiles | Where-Object {
+                -not $selectedFilePathSet.Contains($_.FullName)
+            }
+        )
+        $manualDeletionItems = New-DeletionItemList `
+            -FileList $selectedFilesToDelete `
+            -RootPath $RootPath `
+            -DisplayPathByFullName $DisplayPathByFullName `
+            -ExpectedHash $deletionPlan.Hash `
+            -KeepFileList $keepFileList
 
         $deletionResult = Remove-DeletionItemList -DeletionItemList $manualDeletionItems -Quiet
         $deletedFilePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -2331,7 +2455,12 @@ function New-ReferenceDirectoryDeletionPlan {
         [pscustomobject]@{
             Hash          = $matchRecord.Hash
             KeepPathText = Get-RelativePathText -RootPath $referenceRootPath -FilePath $referenceKeepFile.FullName -PathPrefix $referencePathPrefix
-            DeletionItems = New-DeletionItemList -FileList $matchingTargetFiles -RootPath $TargetRootPath -PathPrefix $targetPathPrefix
+            DeletionItems = New-DeletionItemList `
+                -FileList $matchingTargetFiles `
+                -RootPath $TargetRootPath `
+                -PathPrefix $targetPathPrefix `
+                -ExpectedHash $matchRecord.Hash `
+                -KeepFileList @($referenceKeepFile)
         }
     }
 }

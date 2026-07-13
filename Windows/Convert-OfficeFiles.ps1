@@ -30,8 +30,11 @@ param(
 
 # ========== 可调整配置 ==========
 
-# 转换完成后统一移动文件前的单文件等待时间，给 OneDrive 等同步目录留出短暂缓冲。
-$FileMoveDelayMilliseconds = 1000
+# 转换后移动临时文件的最大尝试次数；仅在文件被 Office、OneDrive 等短暂占用时重试。
+$FileMoveRetryCount = 5
+
+# 移动失败后的基础退避时间；第 N 次失败后等待 N 倍该值。
+$FileMoveRetryBaseDelayMilliseconds = 200
 
 # 输入根目录下的脚本专属临时目录名，避免误用用户原本已有的 tmp 文件夹。
 $TempRootDirectoryName = '.convert-officefiles-tmp'
@@ -95,7 +98,9 @@ function Show-HelpText {
   脚本扫描后直接转换，不需要预览确认。
   存在待转换文件时会创建输入目录或直接文件所在目录下的专属临时文件夹；如该临时目录已存在，会清空复用。
   脚本会先转换到该专属临时文件夹，退出 Office 后再统一移动到目标位置。
+  临时文件正常时立即移动；遇到 Office、OneDrive 等短暂占用时按配置退避重试。
   每个文件单独转换，单个文件失败时记录错误并继续处理后续文件。
+  单个输入范围初始化或扫描失败时记录错误，并继续处理后续独立范围。
 '@
 }
 
@@ -419,6 +424,45 @@ function Remove-TempOutputFile {
     return -not (Test-FileSystemPath -Path $TempOutputPath)
 }
 
+# 将转换后的临时文件移动到最终位置；正常情况立即完成，短暂占用时才按配置退避重试。
+function Move-TempOutputFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TempOutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath
+    )
+
+    $effectiveRetryCount = [Math]::Max(1, [int]$FileMoveRetryCount)
+    $lastErrorMessage = $null
+    for ($attempt = 1; $attempt -le $effectiveRetryCount; $attempt++) {
+        if (-not (Test-FileSystemFile -Path $TempOutputPath)) {
+            throw "临时输出文件已不存在: $TempOutputPath"
+        }
+
+        if (Test-FileSystemPath -Path $TargetPath) {
+            throw "目标文件已存在: $TargetPath"
+        }
+
+        try {
+            [System.IO.File]::Move($TempOutputPath, $TargetPath)
+            return
+        }
+        catch {
+            $lastErrorMessage = $_.Exception.Message
+            if ($attempt -lt $effectiveRetryCount) {
+                $retryDelayMilliseconds = [Math]::Max(0, [int]$FileMoveRetryBaseDelayMilliseconds) * $attempt
+                if ($retryDelayMilliseconds -gt 0) {
+                    Start-Sleep -Milliseconds $retryDelayMilliseconds
+                }
+            }
+        }
+    }
+
+    throw "移动临时输出文件失败，已尝试 $effectiveRetryCount 次。$lastErrorMessage"
+}
+
 # 根据临时输出文件路径清理其所在的空临时目录；如果里面还有文件则保留，避免误删用户内容。
 function Remove-TempOutputDirectoryIfEmpty {
     param(
@@ -551,6 +595,8 @@ function Convert-OfficeFile {
 
     $tempOutputPath = $null
     $document = $null
+    $documentCollection = $null
+    $documentClosed = $false
 
     try {
         if (Test-FileSystemPath -Path $Plan.TargetPath) {
@@ -561,19 +607,25 @@ function Convert-OfficeFile {
         $application = Get-OfficeApplication -AppName $Plan.AppName -ApplicationCache $ApplicationCache
         switch ($Plan.AppName) {
             'Word' {
-                $document = $application.Documents.Open($Plan.SourceFile.FullName, $false, $true, $false)
+                $documentCollection = $application.Documents
+                $document = $documentCollection.Open($Plan.SourceFile.FullName, $false, $true, $false)
                 $document.SaveAs2($tempOutputPath, $Plan.FileFormat)
                 $document.Close($false)
+                $documentClosed = $true
             }
             'Excel' {
-                $document = $application.Workbooks.Open($Plan.SourceFile.FullName, 0, $true)
+                $documentCollection = $application.Workbooks
+                $document = $documentCollection.Open($Plan.SourceFile.FullName, 0, $true)
                 $document.SaveAs($tempOutputPath, $Plan.FileFormat)
                 $document.Close($false)
+                $documentClosed = $true
             }
             'PowerPoint' {
-                $document = $application.Presentations.Open($Plan.SourceFile.FullName, $true, $false, $false)
+                $documentCollection = $application.Presentations
+                $document = $documentCollection.Open($Plan.SourceFile.FullName, $true, $false, $false)
                 $document.SaveAs($tempOutputPath, $Plan.FileFormat)
                 $document.Close()
+                $documentClosed = $true
             }
         }
 
@@ -584,7 +636,7 @@ function Convert-OfficeFile {
         return [pscustomobject]@{ Status = 'ConvertedToTemp'; Message = '临时文件转换成功'; TempOutputPath = $tempOutputPath }
     }
     catch {
-        if ($null -ne $document) {
+        if ($null -ne $document -and -not $documentClosed) {
             try {
                 if ($Plan.AppName -eq 'PowerPoint') {
                     $document.Close()
@@ -608,31 +660,47 @@ function Convert-OfficeFile {
     finally {
         Remove-ComObject -ComObject $document
         $document = $null
+        Remove-ComObject -ComObject $documentCollection
+        $documentCollection = $null
     }
 }
 
-# 统一退出已启动的 Office 应用，并触发垃圾回收清理 COM 引用。
+# 统一退出已启动的 Office 应用，释放 COM 引用并返回退出失败信息。
 function Close-OfficeApplicationCache {
     param(
         [Parameter(Mandatory = $true)]
         [hashtable]$ApplicationCache
     )
 
+    $failureMessageList = [System.Collections.Generic.List[string]]::new()
     foreach ($appName in @($ApplicationCache.Keys)) {
         $application = $ApplicationCache[$appName]
         try {
             $application.Quit()
         }
         catch {
-            Write-Debug "退出 Office 应用失败: $($_.Exception.Message)"
+            $failureMessageList.Add("$appName 退出失败: $($_.Exception.Message)")
         }
         finally {
-            Remove-ComObject -ComObject $application
+            try {
+                Remove-ComObject -ComObject $application
+            }
+            catch {
+                $failureMessageList.Add("$appName COM 引用释放失败: $($_.Exception.Message)")
+            }
         }
     }
 
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
+    $ApplicationCache.Clear()
+    for ($collectionAttempt = 0; $collectionAttempt -lt 2; $collectionAttempt++) {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+    }
+
+    return [pscustomobject]@{
+        Success         = ($failureMessageList.Count -eq 0)
+        FailureMessages = $failureMessageList.ToArray()
+    }
 }
 
 # 在 Office 应用退出后统一移动临时文件到目标位置，并用数量进度条展示移动进度。
@@ -661,7 +729,7 @@ function Move-ConvertedOfficeFileList {
         }
     }
 
-    Write-StageMessage "开始移动转换文件，待移动: $($TempConversionResults.Count)，单文件延时: ${FileMoveDelayMilliseconds}ms"
+    Write-StageMessage "开始移动转换文件，待移动: $($TempConversionResults.Count)，占用失败时最多重试 $FileMoveRetryCount 次"
 
     foreach ($conversionResult in $TempConversionResults) {
         $processedCount++
@@ -669,7 +737,6 @@ function Move-ConvertedOfficeFileList {
         $tempOutputPath = $conversionResult.TempOutputPath
 
         Write-ProgressBar -Activity '移动转换文件' -Status '正在移动文件' -ProcessedCount $processedCount -TotalCount $TempConversionResults.Count -LastPercent ([ref]$lastPercent)
-        Start-Sleep -Milliseconds $FileMoveDelayMilliseconds
 
         if (Test-FileSystemPath -Path $plan.TargetPath) {
             if (Remove-TempOutputFile -TempOutputPath $tempOutputPath) {
@@ -685,7 +752,7 @@ function Move-ConvertedOfficeFileList {
         }
 
         try {
-            [System.IO.File]::Move($tempOutputPath, $plan.TargetPath)
+            Move-TempOutputFile -TempOutputPath $tempOutputPath -TargetPath $plan.TargetPath
             $moveResult = Get-TempOutputMoveResult -TempOutputPath $tempOutputPath -TargetPath $plan.TargetPath
             if (-not $moveResult.IsValid) {
                 throw $moveResult.Message
@@ -786,14 +853,23 @@ function Invoke-ConversionPlanList {
         }
     }
     finally {
-        if ($applicationCache.Count -gt 0) {
+        $hadOfficeApplications = ($applicationCache.Count -gt 0)
+        if ($hadOfficeApplications) {
             [void](Write-RefreshStatusLine -Message '正在退出 Office 应用...' -Color White -NoNewLine)
         }
 
-        Close-OfficeApplicationCache -ApplicationCache $applicationCache
+        $closeResult = Close-OfficeApplicationCache -ApplicationCache $applicationCache
 
-        if ($applicationCache.Count -gt 0) {
-            [void](Write-RefreshStatusLine -Message 'Office 应用已退出' -Color Green)
+        if ($hadOfficeApplications) {
+            if ($closeResult.Success) {
+                [void](Write-RefreshStatusLine -Message 'Office 应用退出请求已完成' -Color Green)
+            }
+            else {
+                [void](Write-RefreshStatusLine -Message '部分 Office 应用退出或 COM 释放失败，移动阶段将按需重试' -Color Yellow)
+                foreach ($failureMessage in @($closeResult.FailureMessages)) {
+                    Write-Host "  $failureMessage" -ForegroundColor DarkGray
+                }
+            }
         }
     }
 
@@ -867,7 +943,7 @@ if ($ConversionScopeList.Count -eq 0) {
 }
 
 $ProcessedSourcePathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$FatalExitCode = 0
+$FinalExitCode = 0
 $ScopeIndex = 0
 foreach ($ConversionScope in $ConversionScopeList) {
     $ScopeIndex++
@@ -894,7 +970,7 @@ foreach ($ConversionScope in $ConversionScopeList) {
     }
     catch {
         Write-Host $_.Exception.Message -ForegroundColor Red
-        $FatalExitCode = 1
+        $FinalExitCode = 1
     }
     finally {
         if (-not [string]::IsNullOrWhiteSpace($TempRootDirectory)) {
@@ -902,11 +978,8 @@ foreach ($ConversionScope in $ConversionScopeList) {
         }
     }
 
-    if ($FatalExitCode -ne 0) {
-        break
-    }
 }
 
-if ($FatalExitCode -ne 0) {
-    exit $FatalExitCode
+if ($FinalExitCode -ne 0) {
+    exit $FinalExitCode
 }

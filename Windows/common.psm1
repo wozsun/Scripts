@@ -554,7 +554,17 @@ function New-FileSystemDirectory {
     return [System.IO.Directory]::CreateDirectory($Path)
 }
 
-# 删除文件或目录；删除前尽量移除常见保护属性，适合清理脚本临时目录和临时文件。
+# 判断文件系统对象是否为符号链接、目录联接点等重解析点。
+function Test-FileSystemInfoReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    return (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+# 删除文件或目录；递归删除不会进入重解析点，避免沿目录联接误删外部内容。
 function Remove-FileSystemItem {
     param(
         [Parameter(Mandatory = $true)]
@@ -564,18 +574,38 @@ function Remove-FileSystemItem {
         [switch]$Recurse
     )
 
-    if ([System.IO.File]::Exists($Path)) {
-        [System.IO.File]::SetAttributes($Path, [System.IO.FileAttributes]::Normal)
-        [System.IO.File]::Delete($Path)
-        if ([System.IO.File]::Exists($Path)) {
-            throw "删除后文件仍存在: $Path"
-        }
-
+    try {
+        $attributes = [System.IO.File]::GetAttributes($Path)
+    }
+    catch [System.IO.FileNotFoundException] {
+        return
+    }
+    catch [System.IO.DirectoryNotFoundException] {
         return
     }
 
-    if (-not [System.IO.Directory]::Exists($Path)) {
+    $isDirectory = (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
+    $isReparsePoint = (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+
+    if (-not $isDirectory) {
+        if (-not $isReparsePoint) {
+            [System.IO.File]::SetAttributes($Path, [System.IO.FileAttributes]::Normal)
+        }
+
+        [System.IO.File]::Delete($Path)
         return
+    }
+
+    # 目录重解析点只删除链接节点本身，绝不能枚举或清理其目标目录。
+    if ($isReparsePoint) {
+        [System.IO.Directory]::Delete($Path, $false)
+        return
+    }
+
+    if ($Recurse) {
+        foreach ($childItem in ([System.IO.DirectoryInfo]::new($Path)).EnumerateFileSystemInfos()) {
+            Remove-FileSystemItem -Path $childItem.FullName -Recurse
+        }
     }
 
     $directoryInfo = [System.IO.DirectoryInfo]::new($Path)
@@ -584,41 +614,8 @@ function Remove-FileSystemItem {
         [System.IO.FileAttributes]::Hidden -bor
         [System.IO.FileAttributes]::System
     )
-
-    if ($Recurse) {
-        foreach ($childFile in $directoryInfo.EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)) {
-            try {
-                $childFile.Attributes = [System.IO.FileAttributes]::Normal
-            }
-            catch {
-                # 删除时会再次抛出真实错误；这里不提前中断。
-                Write-Debug "清理文件属性失败: $($childFile.FullName)。原因: $($_.Exception.Message)"
-            }
-        }
-
-        foreach ($childDirectory in $directoryInfo.EnumerateDirectories('*', [System.IO.SearchOption]::AllDirectories)) {
-            try {
-                $childDirectory.Attributes = [System.IO.FileAttributes](([int]$childDirectory.Attributes) -band (-bnot $attributesToClear))
-            }
-            catch {
-                # 删除时会再次抛出真实错误；这里不提前中断。
-                Write-Debug "清理目录属性失败: $($childDirectory.FullName)。原因: $($_.Exception.Message)"
-            }
-        }
-    }
-
-    try {
-        $directoryInfo.Attributes = [System.IO.FileAttributes](([int]$directoryInfo.Attributes) -band (-bnot $attributesToClear))
-    }
-    catch {
-        # 删除时会再次抛出真实错误；这里不提前中断。
-        Write-Debug "清理目录属性失败: $Path。原因: $($_.Exception.Message)"
-    }
-
-    [System.IO.Directory]::Delete($Path, [bool]$Recurse)
-    if ([System.IO.Directory]::Exists($Path)) {
-        throw "删除后目录仍存在: $Path"
-    }
+    $directoryInfo.Attributes = [System.IO.FileAttributes](([int]$directoryInfo.Attributes) -band (-bnot $attributesToClear))
+    [System.IO.Directory]::Delete($Path, $false)
 }
 
 # 获取目录中的项目数量；可选择在扫描失败时按非空处理，适合临时目录安全判断。
@@ -718,6 +715,11 @@ function Test-SiblingTempDirectoryPath {
     Assert-SiblingTempDirectoryName -TempDirectoryName $TempDirectoryName
 
     try {
+        $actualItem = Get-FileSystemItem -Path $Path
+        if ($null -eq $actualItem -or (Test-FileSystemInfoReparsePoint -Item $actualItem)) {
+            return $false
+        }
+
         $actualPath = ConvertTo-NormalizedPath -Path $Path
         $actualParentPath = [System.IO.Path]::GetDirectoryName($actualPath)
         if ([string]::IsNullOrWhiteSpace($actualParentPath)) {
@@ -738,7 +740,7 @@ function Test-SiblingTempDirectoryPath {
     }
 }
 
-# 创建同目录脚本专属临时目录；已存在的专属临时目录会被清空并复用。
+# 创建同目录脚本专属临时目录；已存在的普通目录会被清空复用，重解析点会被拒绝。
 function Initialize-SiblingTempDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -1061,7 +1063,7 @@ function Resolve-InputPathList {
     }
 }
 
-# 批量解析目录输入、按真实路径去重，并拒绝父子目录。
+# 批量解析目录输入、按规范化路径去重，并拒绝重解析点及父子目录。
 function Resolve-IndependentInputDirectoryList {
     param(
         [Parameter(Mandatory = $true)]
@@ -1087,6 +1089,17 @@ function Resolve-IndependentInputDirectoryList {
             Items   = @()
             Paths   = @()
             Error   = $resolvedResult.Error
+        }
+    }
+
+    foreach ($resolvedItem in @($resolvedResult.Items)) {
+        if (Test-FileSystemInfoReparsePoint -Item $resolvedItem) {
+            return [pscustomobject]@{
+                Success = $false
+                Items   = @()
+                Paths   = @()
+                Error   = "输入目录不能是符号链接或联接点: $($resolvedItem.FullName)"
+            }
         }
     }
 
